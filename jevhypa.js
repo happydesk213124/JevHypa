@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.0.1
+//@version 1.1.0
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -91,6 +91,8 @@
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
     injectMode: 'last_user', injectStyle: 'memo', injectLabel: 'Memory', note: DEFAULT_NOTE, showStoryTime: true,
+    cards: true,
+    translate: 'off', translateKey: '', translateModel: 'google/gemini-2.5-flash-lite',
     showButton: true,
   };
 
@@ -116,7 +118,9 @@
   const MAX_COMPRESS_QUESTIONS = 70;
   const MAX_WORD_QUESTIONS = 20;
   const SPEAKER_ACTIVE_COUNT = 2;
-  const QUERY_MESSAGES = 6;           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
+  const QUERY_MESSAGES = 6;
+  const SECOND_SEARCH = 6;            // 빠진 근거를 찾을 때 더 볼 메모 수
+  const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
 
   const KINDS = {
     profile: { label: '인물정보', desc: 'lasting fact about a character (identity, past, personality, job)' },
@@ -136,6 +140,35 @@
     minor: 'small detail, will not matter later',
     ...Object.fromEntries(KIND_IDS.map(k => [k, KINDS[k].desc])),
   };
+  // 카드 칸: 메모가 어떤 종류의 말·사실인지, 지금도 유효한지
+  const FORMS = {
+    did: 'something that happened or someone did',
+    said: 'what a character said, told, or explained',
+    rule: 'a rule, condition, signal, or instruction',
+    state: 'a fact or current state (where, what, who, how much)',
+    plan: 'a plan, promise, or intention',
+    rumor: 'an unverified rumor or claim',
+    thought: 'a private thought or feeling',
+  };
+  const FORM_TAG = { said: 'said', rule: 'rule', plan: 'plan', rumor: 'unverified', thought: 'thought' };
+  const TENSES = {
+    current: 'still true or in effect now',
+    past: 'a past record, or replaced by newer information',
+    future: 'scheduled or planned',
+  };
+  const KEEP_IMP = 0.8; // 이만큼 중요한 메모는 장면 상한을 넘어도 상한만큼 더 남긴다
+  const RANK_LEVELS = ['unrelated', 'background only', 'useful context', 'answers or explains the latest message']; // 후보마다 붙으니 짧게
+  const SEARCH_NEEDS = {
+    none: 'nothing important is missing',
+    fact: 'a specific earlier fact the latest message asks about (name, number, place, wording)',
+    cause: 'the earlier promise, instruction, or motive behind the current action',
+    change: 'a later update or correction to a recorded state or plan',
+    knowledge: 'who learned, heard, or believes the information',
+  };
+  const NEED_QUERY = { fact: 'earlier record of', cause: 'earlier reason or promise behind', change: 'latest update or correction about', knowledge: 'who knows or told about' };
+  const TRANSLATORS = { off: '끄기', deepl: 'DeepL', llm: 'LLM (OpenRouter)', google: '구글 무료 (비공식)' };
+  const TRANSLATE_TIMEOUT_MS = 8000;
+
   const ENTITY_TYPES = {
     person: { label: '인물', desc: 'name of a person or character' },
     place: { label: '장소', desc: 'name of a specific place' },
@@ -458,6 +491,7 @@
       intros.push(...findIntros(sp.name, body));
     });
     flush();
+    units.forEach((u, i) => { if (i) u.prev = clip(units[i - 1].text, 90); });
     return { status, units: pickUnits(units, cfg), speakers: [...speakers], intros };
   }
 
@@ -657,6 +691,10 @@
       injectLabel: (str(s.injectLabel) === '기억 메모' ? '' : str(s.injectLabel)) || DEFAULT_SETTINGS.injectLabel,
       note: typeof s.note === 'string' && s.note.trim() !== OLD_DEFAULT_NOTE ? s.note.trim() : DEFAULT_NOTE,
       showStoryTime: bool('showStoryTime'),
+      cards: bool('cards'),
+      translate: TRANSLATORS[s.translate] ? s.translate : 'off',
+      translateKey: cleanKey(str(s.translateKey)),
+      translateModel: str(s.translateModel) || DEFAULT_SETTINGS.translateModel,
       showButton: bool('showButton'),
     };
     if (out.jevPreset !== 'custom') { out.jevEndpoint ||= JEV_PRESETS[out.jevPreset].endpoint; out.jevModel ||= JEV_PRESETS[out.jevPreset].model; }
@@ -1389,7 +1427,7 @@
     job.aPromise = Object.keys(job.qa).length ? callJev(job.context, job.qa, cfg).then(r => r.answers) : Promise.resolve({});
     job.aPromise.catch(() => {}); // 기다릴 때 다시 던진다. 미리 보낸 요청이 실패해도 경고만 남지 않게.
     if (PIPELINE && job.units.length) {
-      job.embedPromise = embedTexts([...new Set(job.units.map(u => u.text))], cfg).then(vecs => ({ vecs }), error => ({ error }));
+      job.embedPromise = embedTexts([...new Set(job.units.map(u => embedText(u.text, u.prev)))], cfg).then(vecs => ({ vecs }), error => ({ error }));
     }
   }
 
@@ -1472,6 +1510,7 @@
         place: found.place[0] ?? b.place ?? null, when: b.when, src: b.entry.key, scene: b.scene, arc: b.arc,
       }, recent);
       if (ev && subj) ev.subj = subj;
+      if (ev && u.prev) ev.ctx = u.prev;
       if (ev) added.push(ev);
     });
     // 옷·상태는 사람마다 최신 하나만: 같은 사람의 예전 옷·상태 메모는 "지난 기억"으로
@@ -1492,15 +1531,15 @@
         if (job.embedPromise) {
           const r = await job.embedPromise;
           if (r.error) throw r.error;
-          const texts = [...new Set(job.units.map(u => u.text))];
+          const texts = [...new Set(job.units.map(u => embedText(u.text, u.prev)))];
           vecOfText = new Map(texts.map((t, i) => [t, r.vecs[i]]));
         } else {
-          const vecs = await embedTexts(fresh.map(e => e.t), cfg);
-          vecOfText = new Map(fresh.map((e, i) => [e.t, vecs[i]]));
+          const vecs = await embedTexts(fresh.map(e => embedText(e.t, e.ctx)), cfg);
+          vecOfText = new Map(fresh.map((e, i) => [embedText(e.t, e.ctx), vecs[i]]));
         }
         if (owner !== state) return false;
         const vp = embedProfile(cfg);
-        for (const e of fresh) { const v = vecOfText.get(e.t); if (v) { e.vec = encodeVec(v); e.vp = vp; } }
+        for (const e of fresh) { const v = vecOfText.get(embedText(e.t, e.ctx)); if (v) { e.vec = encodeVec(v); e.vp = vp; } }
       } catch (error) {
         setError('임베딩', error); // 벡터 없이도 저장은 한다. 나중에 "임베딩 다시 계산"으로 채움
       }
@@ -1519,6 +1558,21 @@
       const rec = cfg.supersede ? buildReconcile(fresh) : { pairs: [], questions: {} };
       Object.assign(qb, rec.questions);
       const comp = { plan: [], questions: {} }; // Jev 압축은 메모가 처음 쓰일 때 한다(compressRecalled)
+      // 카드 칸: 형식(말·행동·규칙·소문…) · 시점(현재·과거·예정) · 대사가 누구 얘기인지
+      const cardAsk = cfg.cards ? fresh.filter(e => e.kind !== 'outfit') : [];
+      const aboutOpts = new Map();
+      cardAsk.forEach((e, j) => {
+        qb[`c${j}`] = { type: 'choice', instructions: `Form of «${e.t}»`, criteria: FORMS };
+        qb[`n${j}`] = { type: 'choice', instructions: `Is «${e.t}» still true now?`, criteria: TENSES };
+        const sp = /^([^:"“]{1,15}):\s/.exec(e.t)?.[1];
+        if (!sp) return;
+        const speaker = canonical(sp);
+        const others = [...new Set([...e.who, ...(state.scene?.cast ?? [])])].filter(n => n !== speaker && state.dict.e[n]?.type === 'person').slice(0, 6);
+        if (!others.length) return;
+        const opts = { __self: `${speaker} (the speaker)`, ...Object.fromEntries(others.map(n => [n, n])), __world: 'a place, thing, or the world' };
+        aboutOpts.set(j, { speaker, opts });
+        qb[`o${j}`] = { type: 'choice', instructions: `Who or what is «${e.t}» mainly about?`, criteria: opts };
+      });
       if (Object.keys(qb).length) {
         try {
           const B = (await callJev(job.context, qb, cfg)).answers;
@@ -1535,6 +1589,22 @@
           });
           applyReconcile(rec.pairs, B);
           applyCompress(comp.plan, B);
+          cardAsk.forEach((e, j) => {
+            const pf = choiceProbs(B[`c${j}`], Object.keys(FORMS));
+            const f = argmax(pf);
+            if (f && pf[f] >= 0.35) e.form = f;
+            const pt = choiceProbs(B[`n${j}`], Object.keys(TENSES));
+            const t = argmax(pt);
+            if (t && pt[t] >= 0.35) e.tense = t;
+            const ab = aboutOpts.get(j);
+            if (!ab) return;
+            const pa = choiceProbs(B[`o${j}`], Object.keys(ab.opts));
+            const a = argmax(pa);
+            if (a && a !== '__self' && a !== '__world' && pa[a] >= 0.5) {
+              e.about = a;
+              e.who = [a, ...e.who.filter(w => w !== a)].slice(0, 4); // 남 얘기면 그 사람 밑으로
+            }
+          });
         } catch (error) {
           setError('메모 정리', error); // 실패해도 메모는 원문 그대로 남는다
         }
@@ -1579,6 +1649,8 @@
     return done;
   }
 
+  const embedText = (text, ctx) => (ctx ? `${ctx} ${text}` : text);
+
   function addEvent(fields, recent) {
     const grams = bigrams(fields.t);
     for (const r of recent) {
@@ -1608,7 +1680,9 @@
       const cap = sceneCap(sceneById(sid), cfg);
       if (evs.length <= cap) continue;
       evs.sort((a, b) => rankOf(b) - rankOf(a) || b.id - a.id);
-      for (const e of evs.slice(cap)) if (!e.pin) drop.add(e.id);
+      // 상한을 넘은 것 중 아주 중요한 것은 상한의 2배까지 남긴다(정보가 몰린 장면에서 사실이 잘려 나가지 않게)
+      let spare = cap;
+      for (const e of evs.slice(cap)) { if (e.pin) continue; if (e.imp >= KEEP_IMP && spare > 0) { spare--; continue; } drop.add(e.id); }
     }
     if (drop.size) {
       state.events = state.events.filter(e => !drop.has(e.id));
@@ -1792,7 +1866,7 @@
     const todo = state.events.filter(e => e.vp !== vp);
     for (let i = 0; i < todo.length; i += EMBED_CHUNK) {
       const chunk = todo.slice(i, i + EMBED_CHUNK);
-      const vecs = await embedTexts(chunk.map(e => e.t));
+      const vecs = await embedTexts(chunk.map(e => embedText(e.t, e.ctx)));
       if (owner !== state) return;
       chunk.forEach((e, j) => { e.vec = encodeVec(vecs[j]); e.vp = vp; });
       onProgress?.(Math.min(todo.length, i + EMBED_CHUNK), todo.length);
@@ -1844,8 +1918,8 @@
 
   function eventLabel(e) {
     const a = arcById(e.arc);
-    const bits = [KINDS[e.kind]?.label ?? '사건', e.who.join(', '), formatWhen(e.when, true), e.place].filter(Boolean);
-    return `(${bits.join(' · ')}${a ? ` · ${arcTitle(a)}` : ''}) ${e.t}`;
+    const bits = [KINDS[e.kind]?.label ?? '사건', e.who.join(', '), formatWhen(e.when, true), e.place, e.form, e.old ? 'past' : e.tense].filter(Boolean);
+    return `(${bits.join(' · ')}${a ? ` · ${arcTitle(a)}` : ''}) ${clip(e.t, 200)}`; // 후보마다 붙으니 긴 묘사는 자른다
   }
 
   function arcCardText(a) {
@@ -1853,6 +1927,20 @@
       a.cast.length && `cast: ${a.cast.join(', ')}`, a.places.length && `places: ${a.places.join(', ')}`, a.kw.length && `keywords: ${a.kw.join(', ')}`]
       .filter(Boolean).join(' · ');
   }
+
+  /** Jev 점수 답 → 0~1. score가 없으면 확률 기대값, 그것도 없으면 noul. */
+  function rankProb(a) {
+    const max = RANK_LEVELS.length - 1;
+    if (Number.isFinite(Number(a?.score))) return Math.max(0, Math.min(1, Number(a.score) / max));
+    const pr = a?.probabilities;
+    if (pr && typeof pr === 'object' && Object.keys(pr).length) {
+      let sum = 0, tot = 0;
+      for (const [k, v] of Object.entries(pr)) { const lv = Number.isFinite(Number(k)) ? Number(k) : RANK_LEVELS.indexOf(k); if (lv >= 0) { sum += lv * Number(v); tot += Number(v); } }
+      if (tot > 0) return Math.max(0, Math.min(1, sum / tot / max));
+    }
+    return noulProb(a);
+  }
+  const rankQuestion = (e) => ({ type: 'score', instructions: `How useful for replying to the latest message? «${eventLabel(e)}»`, criteria: RANK_LEVELS });
 
   async function queryVector(text, cfg) {
     const key = hashText(embedProfile(cfg) + '|' + text);
@@ -1882,7 +1970,7 @@
     const pool = state.events.filter(e => isActive(e) && !visibleHashes.has(e.src));
     if (!pool.length || cfg.recallBudget === 0) { trace.note = pool.length ? '회상 꺼짐' : '아직 꺼낼 메모가 없어요'; return { picks: [], trace, sc }; }
 
-    const queryState = (sceneHeader(sc) + entries.slice(-QUERY_MESSAGES).map(e => labelled(e)).join('\n\n')).slice(-MAX_STATE_CHARS);
+    const queryState = (sceneHeader(sc) + entries.slice(-QUERY_MESSAGES).map(e => labelled(e)).join('\n\n')).slice(-RECALL_STATE_CHARS);
     let qv = null;
     try { qv = await sceneVector(sc, cfg); trace.usedEmbed = true; }
     catch (error) { setError('질문 임베딩', error); }
@@ -1936,21 +2024,39 @@
         if (chosenArcs.length > 1) {
           q.arc = { type: 'choice', instructions: 'Most relevant past chapter for the current scene?', criteria: { ...arcOpts, none: 'none of these' } };
         }
-        for (const x of cands) {
-          q[`m${x.e.id}`] = {
-            type: 'noul',
-            instructions: `Needed to answer the latest message or keep the scene consistent? «${eventLabel(x.e)}»`,
-          };
-        }
+        for (const x of cands) q[`r${x.e.id}`] = rankQuestion(x.e);
+        // 후보에 없는 근거가 필요해 보이면 그 목적으로 한 번 더 찾는다(Archive Center 방식)
+        if (pool.length > cands.length) q.need = { type: 'choice', instructions: 'Which earlier record, if any, is still missing to answer the latest message?', criteria: SEARCH_NEEDS };
         const { answers } = await callJev(queryState, q, cfg);
         const pArc = q.arc ? choiceProbs(answers.arc, [...Object.keys(arcOpts), 'none']) : { a0: 1 };
         const arcP = new Map(chosenArcs.map((x, k) => [x.a.id, pArc[`a${k}`] ?? 0]));
         const maxArc = Math.max(0.0001, ...arcP.values());
-        judged = cands.map(x => {
-          const pm = noulProb(answers[`m${x.e.id}`]);
+        const judge = (list, ans) => list.map(x => {
+          const pm = rankProb(ans[`r${x.e.id}`]);
           const pa = arcP.has(x.e.arc) ? arcP.get(x.e.arc) / maxArc : 0.5;
           return { ...x, pm, p: pm * (0.75 + 0.25 * pa) };
         });
+        judged = judge(cands, answers);
+        const need = q.need ? argmax(choiceProbs(answers.need, Object.keys(SEARCH_NEEDS))) : null;
+        if (need && need !== 'none') {
+          trace.need = need;
+          const seenIds = new Set(cands.map(x => x.e.id));
+          const nq = `${NEED_QUERY[need] ?? ''} ${clip(sc.focusText, 600)}`;
+          let nv = null;
+          try { nv = await queryVector(nq, cfg); } catch { /* 단어 겹침만으로 */ }
+          const ng = bigrams(nq);
+          const extra = pool.filter(e => !seenIds.has(e.id)).map(e => {
+            const ev = vecOf(e);
+            const sem = nv && ev ? Math.max(0, dot(nv, ev)) : 0;
+            const lex = (coverage(gramsOf(e), ng) + coverage(ng, gramsOf(e))) / 2;
+            return { e, s: (nv && ev ? sem * 0.7 : 0) + lex * 0.5, sem, lex, second: true };
+          }).sort((a, b) => b.s - a.s).slice(0, SECOND_SEARCH);
+          if (extra.length) {
+            const q2 = Object.fromEntries(extra.map(x => [`r${x.e.id}`, rankQuestion(x.e)]));
+            const a2 = (await callJev(queryState, q2, cfg)).answers;
+            judged.push(...judge(extra, a2));
+          }
+        }
         trace.usedJev = true;
         trace.arcP = Object.fromEntries(arcP);
         if (!dry) { recallCache.set(cacheKey, judged); if (recallCache.size > 20) recallCache.delete(recallCache.keys().next().value); }
@@ -1985,7 +2091,7 @@
     picks.sort((a, b) => a.e.id - b.e.id);
     const pickIds = new Set(picks.map(x => x.e.id));
     trace.arcs = arcScores.slice(0, 6).map(x => ({ id: x.a.id, title: arcTitle(x.a), s: round2(x.s), chosen: chosenIds.has(x.a.id), p: trace.arcP?.[x.a.id] != null ? round2(trace.arcP[x.a.id]) : null }));
-    trace.cands = judged.map(x => ({ id: x.e.id, s: round2(x.s), p: x.pm == null ? null : round2(x.p), pick: pickIds.has(x.e.id) })).sort((a, b) => (b.p ?? -1) - (a.p ?? -1));
+    trace.cands = judged.map(x => ({ id: x.e.id, s: round2(x.s), p: x.pm == null ? null : round2(x.p), pick: pickIds.has(x.e.id), second: !!x.second })).sort((a, b) => (b.p ?? -1) - (a.p ?? -1));
     trace.ms = Date.now() - started;
     return { picks, trace, sc };
   }
@@ -2029,8 +2135,18 @@
         const canon = canonical(sp[1]);
         text = canon === group ? text.slice(sp[0].length) : `${canon}: ${text.slice(sp[0].length)}`;
       }
-      return `- ${w ? `[${w}] ` : ''}${e.r === 'u' ? '(유저) ' : ''}${text}`;
+      const tags = [];
+      if (e.r === 'u') tags.push('user');
+      if (e.form && FORM_TAG[e.form]) tags.push(FORM_TAG[e.form]);
+      if (e.old || e.tense === 'past') tags.push('past');
+      else if (e.tense === 'future') tags.push('planned');
+      else if (e.tense === 'current' && (e.form === 'state' || e.form === 'rule' || e.form === 'plan')) tags.push('current');
+      // 앞 문장은 메모에 이름(인물·장소·물건)이 하나도 없어서 무엇에 관한 말인지 모를 때만 붙인다
+      const bare = (() => { const f = findEntities(text.replace(/^[^:"“]{1,15}:s/, '')); return !f.person.length && !f.place.length && !f.item.length; })();
+      const ctx = cfg.cards && e.ctx && bare && !pickedTexts.has(e.ctx) ? ` (context: ${clip(e.ctx, 60)})` : '';
+      return `- ${w ? `[${w}] ` : ''}${tags.length ? `(${tags.join(', ')}) ` : ''}${text}${ctx}`;
     };
+    const pickedTexts = new Set(picks.map(x => clip(x.e.t, 90)));
     const groups = new Map();
     for (const { e } of picks) {
       const key = e.who[0] ?? (e.kind === 'world' ? WORLD : '기타');
@@ -2041,7 +2157,73 @@
     const order = [...groups.keys()].sort((a, b) => (a === WORLD) - (b === WORLD) || (a === '기타') - (b === '기타') || cast.has(b) - cast.has(a));
     const groupName = (k) => (k === WORLD ? 'World' : k === '기타' ? 'Other' : k);
     const body = order.map(k => `<${groupName(k)}>\n${groups.get(k).map(e => line(e, k)).join('\n')}`).join('\n');
-    return [`[${label}]`, cfg.note, arcLine, body, `[/${label}]`].filter(Boolean).join('\n');
+    const note = cfg.note && cfg.translate !== 'off' ? `${cfg.note} Names may be romanized.` : cfg.note;
+    return [`[${label}]`, note, arcLine, body, `[/${label}]`].filter(Boolean).join('\n');
+  }
+
+  // 메모 줄만 영어로. 같은 줄은 이번 실행 동안만 기억해 두고 다시 번역하지 않는다(저장하지 않음).
+  const transCache = new Map();
+  const HANGUL = /[가-힣]/;
+  async function viaDeepl(texts, cfg) {
+    const key = cleanKey(cfg.translateKey);
+    if (!key) throw new Error('DeepL 키가 비어 있어요.');
+    const host = /:fx$/.test(key) ? 'https://api-free.deepl.com' : 'https://api.deepl.com';
+    const data = await fetchJson(`${host}/v2/translate`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `DeepL-Auth-Key ${key}` }, body: JSON.stringify({ text: texts, target_lang: 'EN-US' }) }, TRANSLATE_TIMEOUT_MS, 'DeepL');
+    return texts.map((_, i) => String(data?.translations?.[i]?.text ?? ''));
+  }
+  async function viaGoogle(texts) {
+    const out = [];
+    for (let i = 0; i < texts.length;) {
+      const chunk = [];
+      let len = 0;
+      while (i < texts.length && (chunk.length === 0 || len + texts[i].length < 1500)) { len += texts[i].length + 1; chunk.push(texts[i++]); }
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(chunk.join('\n'))}`;
+      const data = await fetchJson(url, { method: 'GET' }, TRANSLATE_TIMEOUT_MS, '구글 번역');
+      const parts = (Array.isArray(data?.[0]) ? data[0] : []).map(seg => (Array.isArray(seg) ? String(seg[0] ?? '') : '')).join('').split('\n');
+      out.push(...(parts.length === chunk.length ? parts.map(p => p.trim()) : chunk.map(() => ''))); // 줄이 안 맞으면 그 묶음은 원문
+    }
+    return out;
+  }
+  async function viaLlm(texts, cfg) {
+    const key = cleanKey(cfg.translateKey || (cfg.jevPreset === 'openrouter' ? cfg.jevKey : ''));
+    if (!key) throw new Error('LLM 번역 키가 비어 있어요. (OpenRouter 키)');
+    const data = await fetchJson('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: cfg.translateModel || DEFAULT_SETTINGS.translateModel, temperature: 0,
+        messages: [
+          { role: 'system', content: 'Translate each numbered line into concise English. Keep the numbering and the number of lines. Fix choppy wording, but do not add facts or explanations.' },
+          { role: 'user', content: texts.map((t, i) => `${i + 1}. ${t}`).join('\n') },
+        ],
+      }),
+    }, TRANSLATE_TIMEOUT_MS * 2, 'LLM 번역');
+    const got = new Map();
+    for (const line of String(data?.choices?.[0]?.message?.content ?? '').split('\n')) { const m = /^\s*(\d+)[.)]\s*(.+)$/.exec(line); if (m) got.set(Number(m[1]), m[2].trim()); }
+    return texts.map((_, i) => got.get(i + 1) ?? '');
+  }
+  async function translateBlock(block, cfg = settings) {
+    if (!block || cfg.translate === 'off') return block;
+    const lines = block.split('\n');
+    const slots = [];
+    lines.forEach((l, i) => {
+      const m = /^(- (?:\[[^\]]*\] )?(?:\([^)]*\) )?)(.+)$/.exec(l);
+      if (m && HANGUL.test(m[2])) slots.push({ i, head: m[1], text: m[2] });
+    });
+    if (!slots.length) return block;
+    try {
+      const need = [...new Set(slots.map(x => x.text).filter(t => !transCache.has(t)))];
+      if (need.length) {
+        const fn = cfg.translate === 'deepl' ? viaDeepl : cfg.translate === 'llm' ? viaLlm : viaGoogle;
+        const out = await fn(need, cfg);
+        need.forEach((t, k) => { if (out[k]) transCache.set(t, out[k]); });
+        while (transCache.size > 800) transCache.delete(transCache.keys().next().value);
+      }
+      for (const x of slots) lines[x.i] = x.head + (transCache.get(x.text) ?? x.text);
+      stats.translatedLines = (stats.translatedLines ?? 0) + slots.length;
+    } catch (error) {
+      setError('번역', error); // 실패하면 한국어 그대로 보낸다
+    }
+    return lines.join('\n');
   }
 
   function inject(messages, block, cfg = settings) {
@@ -2136,7 +2318,7 @@
 
       const { picks, trace, sc } = await recall(entries, visible, cfg);
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
-      const block = formatMemories(picks, sc, cfg);
+      const block = await translateBlock(formatMemories(picks, sc, cfg), cfg);
       const injectedTokens = block ? estimateTokens(block) : 0;
       state.savedTokens = (state.savedTokens ?? 0) + Math.max(0, droppedTokens - injectedTokens);
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
@@ -2671,7 +2853,7 @@
     const { outside } = splitRaw(entries, settings);
     const visible = new Set(entries.filter(e => !outside.includes(e) || !isSeen(e)).flatMap(e => [e.key, e.hash]));
     const { picks, trace, sc } = await recall(entries, visible, settings, { dry: true });
-    const preview = formatMemories(picks, sc, settings);
+    const preview = await translateBlock(formatMemories(picks, sc, settings), settings);
     return { ...trace, preview, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
   }
 
@@ -2701,6 +2883,7 @@
         ${field('"기타" 단어 자동 비우기', 'Jev가 그냥 단어라고 판정해서 다시 묻지 않는 목록을 정해진 턴마다 비워요. 잘못 판정된 이름이 다시 기회를 얻지만, 다시 묻느라 토큰이 조금 더 들어요.', sw('rejAutoClear', d.rejAutoClear))}
         ${field('비우는 간격 (턴)', '', `<input class="inp" type="number" inputmode="numeric" min="10" max="10000" data-field="rejClearEvery" value="${escapeHtml(d.rejClearEvery)}">`)}
         ${field('메모 압축', '말버릇을 빼고, 메모가 처음 쓰일 때 Jev가 원문에서 필요한 단어만 골라 짧게 만들어요. 원문은 보관돼요.', sw('compress', d.compress))}
+        ${field('카드로 정리', '메모마다 형식(말·규칙·소문…), 지금도 유효한지, 누구 얘기인지, 앞 문장을 Jev로 붙여요. 메모당 Jev 문항이 2~3개 늘어요.', sw('cards', d.cards))}
         ${field('바뀐 기억 정리', '새 메모가 옛 메모를 뒤집으면 옛 것을 "지난 기억"으로 내려요. 같은 말 반복도 걸러요.', sw('supersede', d.supersede))}
       </div>
       <div class="sec">주입</div><div class="card">
@@ -2709,6 +2892,9 @@
         ${field('메인 모델에게 하는 안내', '메모가 어색할 수 있으니 뜻을 추론하라고 알려 주는 문장. 비우면 안 넣어요.', `<textarea class="ta" data-field="note" style="min-height:70px">${escapeHtml(d.note)}</textarea>`)}
         ${field('블록 이름', '', `<input class="inp" data-field="injectLabel" value="${escapeHtml(d.injectLabel)}">`)}
         ${field('이야기 날짜 붙이기', '[04-03 09:15] / [2일차]', sw('showStoryTime', d.showStoryTime))}
+        ${field('메모 번역 (보낼 때만)', '메인 모델에 보내기 직전에 메모 줄만 영어로 바꿔 토큰을 아껴요. 저장된 메모는 한국어 그대로예요. 구글 무료는 공식 API가 아니라 언제든 막힐 수 있어요.', `<select class="sel" data-field="translate">${Object.entries(TRANSLATORS).map(([k, v]) => `<option value="${k}"${d.translate === k ? ' selected' : ''}>${v}</option>`).join('')}</select>`)}
+        <div data-tr="deepl llm" style="${d.translate === 'deepl' || d.translate === 'llm' ? '' : 'display:none'}">${field('번역 키', 'DeepL: API 키 (무료 키는 :fx로 끝나요) · LLM: OpenRouter 키 (비우면 Jev 키)', `<input class="inp" type="password" autocomplete="off" data-field="translateKey" value="${escapeHtml(d.translateKey)}">`)}</div>
+        <div data-tr="llm" style="${d.translate === 'llm' ? '' : 'display:none'}">${field('번역 모델', 'OpenRouter 모델 ID', `<input class="inp" data-field="translateModel" value="${escapeHtml(d.translateModel)}">`)}</div>
       </div>
       <div class="sec">화면</div><div class="card">
         ${field('우측 상단 바로가기', '채팅 화면에 🧠 버튼을 띄워요.', sw('showButton', d.showButton))}
@@ -2864,6 +3050,7 @@
       scheduleSettingsSave();
       return;
     }
+    if (el.dataset?.field === 'translate') document.querySelectorAll('[data-tr]').forEach(r => { r.style.display = r.dataset.tr.split(' ').includes(el.value) ? '' : 'none'; });
     if (el.dataset?.field && ui.tab === 'settings' && !ui.wiz) { scheduleSettingsSave(); return; }
     if (act === 'who-select') { ui.who = el.value; render(); return; }
     if (act === 'ent-type') { const x = state.dict.e[el.dataset.name]; if (x) { x.type = el.value; matcherCache = null; await persist(); render(); } return; }
@@ -3173,7 +3360,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, splitRaw, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
