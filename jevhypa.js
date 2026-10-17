@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.0.0
+//@version 1.0.1
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -332,6 +332,8 @@
   const STATUS_SEP = /[◆◇■□●○|│¦/·•]/u;
   const PLACE_LABEL = /(?:^|[\s\[|◆])(?:장소|위치|📍)\s*[:：]?\s*([^\n◆|│\]]{2,24})/u;
 
+  const STATUS_TITLE = /status|window|상태창|정보창|스테이터스|^info/i;
+
   function parseStatus(text) {
     const lines = text.split('\n');
     const out = { d: null, t: null, weather: null, place: null, lines: new Set() };
@@ -366,6 +368,7 @@
         if (!out.weather && WEATHER_WORD.test(seg)) { out.weather = WEATHER_WORD.exec(seg)[1]; continue; }
         if (out.place || /\d/.test(seg) || seg.length < 2 || seg.length > 20) continue;
         if (/^\(?[월화수목금토일]\)?(요일)?$/.test(seg) || /^(장소|위치|날씨|시간)\s*[:：]/.test(seg)) continue;
+        if (STATUS_TITLE.test(seg)) continue;
         out.place = seg.replace(/^[\p{Extended_Pictographic}️\s]+/u, '').trim() || null;
       }
     }
@@ -420,6 +423,17 @@
     return out;
   }
 
+  // 대사는 짧은 문장끼리 이 길이까지 묶는다. "규칙이 하나 있어. 해가 지면 숲에 가지 마."처럼 뒷문장만으로는 뜻이 안 남는 경우가 많다.
+  const QUOTE_UNIT = 90;
+  function packSentences(list, max) {
+    const out = [];
+    for (const s of list) {
+      if (out.length && out[out.length - 1].length + 1 + s.length <= max) out[out.length - 1] += ' ' + s;
+      else out.push(s);
+    }
+    return out;
+  }
+
   /** 메시지 하나 → { 상태줄 정보, 기억 후보 문장들, 화자들, 자기소개 } */
   function analyzeEntry(text, cfg) {
     const clean = cleanText(stripMeta(text));
@@ -440,7 +454,7 @@
       flush();
       speakers.add(sp.name);
       const body = stripQuotes(sp.quote);
-      for (const s of splitSentences(body)) units.push({ text: `${sp.name}: "${s}"`, speaker: sp.name });
+      for (const s of packSentences(splitSentences(body), QUOTE_UNIT)) units.push({ text: `${sp.name}: "${s}"`, speaker: sp.name });
       intros.push(...findIntros(sp.name, body));
     });
     flush();
@@ -452,8 +466,20 @@
   function unitScore(u) {
     const f = findEntities(u.text);
     return Math.min(2, f.person.length) * 1.5 + (f.place.length || f.item.length ? 1 : 0) + (u.speaker ? 0.8 : 0) +
-      (SIGNAL.test(u.text) ? 2 : 0) + Math.min(1, u.text.length / 120);
+      (SIGNAL.test(u.text) ? 2 : 0) + Math.min(1, u.text.length / 120) - (u.text.length > 220 ? 1 : 0); // 너무 긴 묘사 문장은 덜
   }
+  // 서술 문장의 주어: 앞쪽 몇 어절 안의 "○○은/는/이/가". 1인칭 서술(나는, 내 …)은 유저 캐릭터.
+  const SUBJ_TOKEN = /^([가-힣]{2,6}|[A-Z][a-zA-Z]{1,15})(은|는|이|가)$/u;
+  const NARRATOR_I = /(?:^|[\s"“(])(?:나는|내가|나를|나의|나도|나에게|나한테|내|날)(?=\s)/u;
+  function subjectOf(text) {
+    if (/^[^:"“]{1,15}:\s/.test(text)) return null; // 대사 줄은 화자가 있다
+    for (const tok of text.replace(/^[\s"“'‘(\[]+/u, '').split(/\s+/).slice(0, 4)) {
+      const m = SUBJ_TOKEN.exec(tok.replace(/[,.!?…~]+$/u, ''));
+      if (m && !WORD_STOP.has(m[1]) && !EN_STOP.has(m[1])) return m[1];
+    }
+    return null;
+  }
+
   function pickUnits(units, cfg) {
     const k = Math.max(4, (cfg.eventsPerScene ?? 4) + 2);
     if (units.length <= k) return units;
@@ -1432,12 +1458,20 @@
       const b = batch[u.bi];
       const found = findEntities(u.text);
       const who = [];
+      let subj = null;
       if (u.speaker) who.push(canonical(u.speaker));
+      else if (personaCache && b.entry.role === 'assistant' && NARRATOR_I.test(u.text)) who.push(canonical(personaCache));
+      else {
+        const sj = subjectOf(u.text);
+        if (sj && state.dict.e[canonical(sj)]?.type === 'person') who.push(canonical(sj));
+        else if (sj && !knownWord(sj)) subj = sj; // 처음 보는 주어: Jev B에게 이 사람이 주인공인지 묻는다
+      }
       for (const pn of found.person) if (!who.includes(pn)) who.push(pn);
       const ev = addEvent({
         t: u.text, r: b.entry.role === 'user' ? 'u' : 'c', imp: Math.round(imp * 100) / 100, kind, who: who.slice(0, 4),
         place: found.place[0] ?? b.place ?? null, when: b.when, src: b.entry.key, scene: b.scene, arc: b.arc,
       }, recent);
+      if (ev && subj) ev.subj = subj;
       if (ev) added.push(ev);
     });
     // 옷·상태는 사람마다 최신 하나만: 같은 사람의 예전 옷·상태 메모는 "지난 기억"으로
@@ -1473,14 +1507,15 @@
 
       if (cfg.compress) for (const e of fresh) applyFreeTrim(e);
       const persons = personList();
-      const whoAsk = fresh.filter(e => !e.who.length && e.kind !== 'world' && persons.length);
-      const whoOptions = Object.fromEntries([
+      const whoAsk = fresh.filter(e => e.subj || (!e.who.length && e.kind !== 'world' && persons.length));
+      const whoOptions = (e) => Object.fromEntries([
         ...persons.map(n => [n, n]),
+        ...(e.subj ? [['__subj', `${e.subj} (a character named in the sentence)`]] : []),
         [WORLD, 'the world, a place, or a group'],
         ['__other', 'someone else'],
       ]);
       const qb = {};
-      whoAsk.forEach((e, j) => { qb[`w${j}`] = { type: 'choice', instructions: `Main subject of «${e.t}»`, criteria: whoOptions }; });
+      whoAsk.forEach((e, j) => { qb[`w${j}`] = { type: 'choice', instructions: `Main subject of «${e.t}»`, criteria: whoOptions(e) }; });
       const rec = cfg.supersede ? buildReconcile(fresh) : { pairs: [], questions: {} };
       Object.assign(qb, rec.questions);
       const comp = { plan: [], questions: {} }; // Jev 압축은 메모가 처음 쓰일 때 한다(compressRecalled)
@@ -1489,8 +1524,14 @@
           const B = (await callJev(job.context, qb, cfg)).answers;
           if (owner !== state) return false;
           whoAsk.forEach((e, j) => {
-            const p = choiceProbs(B[`w${j}`], Object.keys(whoOptions));
-            e.who = persons.filter(n => p[n] >= 0.3).sort((a, b) => p[b] - p[a]).slice(0, 3);
+            const p = choiceProbs(B[`w${j}`], Object.keys(whoOptions(e)));
+            if (e.subj && argmax(p) === '__subj' && p.__subj >= 0.5) {
+              addEntity(e.subj, 'person', 'jev');
+              const name = canonical(e.subj);
+              e.who = [name, ...e.who.filter(w => w !== name)].slice(0, 4);
+            } else if (!e.who.length) {
+              e.who = persons.filter(n => p[n] >= 0.3).sort((a, b) => p[b] - p[a]).slice(0, 3);
+            }
           });
           applyReconcile(rec.pairs, B);
           applyCompress(comp.plan, B);
@@ -1499,6 +1540,7 @@
         }
       }
     }
+    for (const e of fresh) delete e.subj;
     for (const sid of job.touchedScenes) refreshScene(sceneById(sid));
     for (const aid of job.touchedArcs) refreshArc(arcById(aid));
     for (const b of batch) seenSet.add(b.entry.key);
@@ -1555,14 +1597,18 @@
 
   const rankOf = (e) => e.imp + (CORE_KINDS.has(e.kind) ? 0.1 : 0) + (e.pin ? 10 : 0);
 
+  // 장면 경계가 잘 안 잡히는 채팅(상태줄 없음)은 한 장면이 수십 턴이 된다. 긴 장면은 메시지 4개마다 한 자리씩 더 준다.
+  const sceneCap = (scene, cfg) => cfg.eventsPerScene + Math.floor(Math.max(0, (scene?.turns ?? 0) - 8) / 4);
+
   /** 장면마다 활성 메모를 상위 N개만 남긴다. 남은 것 중 이번에 새로 생긴 것의 id를 돌려준다. */
   function capScenes(sceneIds, cfg, newIds) {
     const drop = new Set();
     for (const sid of sceneIds) {
       const evs = state.events.filter(e => e.scene === sid && isActive(e) && e.kind !== 'outfit'); // 옷·상태는 사람당 하나라 상한에서 뺀다
-      if (evs.length <= cfg.eventsPerScene) continue;
+      const cap = sceneCap(sceneById(sid), cfg);
+      if (evs.length <= cap) continue;
       evs.sort((a, b) => rankOf(b) - rankOf(a) || b.id - a.id);
-      for (const e of evs.slice(cfg.eventsPerScene)) if (!e.pin) drop.add(e.id);
+      for (const e of evs.slice(cap)) if (!e.pin) drop.add(e.id);
     }
     if (drop.size) {
       state.events = state.events.filter(e => !drop.has(e.id));
@@ -1597,7 +1643,7 @@
     if (!a) return;
     const evs = state.events.filter(e => e.arc === a.id && isActive(e));
     const scenes = a.sceneIds.map(sceneById).filter(Boolean);
-    const cast = new Map(), places = new Map(), words = new Map();
+    const cast = new Map(), places = new Map(), words = new Map(), wordEvents = new Map();
     for (const e of evs) {
       for (const w of e.who) cast.set(w, (cast.get(w) ?? 0) + 1 + e.imp);
       if (e.place) places.set(e.place, (places.get(e.place) ?? 0) + 1);
@@ -1606,13 +1652,14 @@
         if (state.dict.e[canonical(w)]?.type === 'person') continue; // 인물은 cast에 따로
         if (KW_STOP.test(w) || KW_STOP_WORDS.has(w)) continue;
         words.set(w, (words.get(w) ?? 0) + e.imp);
+        wordEvents.set(w, (wordEvents.get(w) ?? 0) + 1);
       }
     }
     for (const s of scenes) if (s.place) places.set(s.place, (places.get(s.place) ?? 0) + 0.5);
     const df = (w) => state.arcs.filter(x => x !== a && x.kw?.includes(w)).length;
     a.cast = [...cast.entries()].sort((x, y) => y[1] - x[1]).map(([n]) => n).slice(0, 6);
     a.places = [...places.entries()].sort((x, y) => y[1] - x[1]).map(([n]) => n).slice(0, 4);
-    a.kw = [...words.entries()].map(([w, v]) => [w, v / (1 + df(w))]).sort((x, y) => y[1] - x[1]).map(([w]) => w).slice(0, 8);
+    a.kw = [...words.entries()].filter(([w]) => evs.length < 4 || wordEvents.get(w) >= 2).map(([w, v]) => [w, v / (1 + df(w))]).sort((x, y) => y[1] - x[1]).map(([w]) => w).slice(0, 8);
     if (scenes.length) { a.from = scenes[0].from; a.to = scenes[scenes.length - 1].to; }
     const vecs = evs.map(vecOf).filter(Boolean);
     if (vecs.length) {
@@ -1782,7 +1829,8 @@
     const ranges = TIME_HINTS.filter(([re]) => re.test(latest)).map(([, from, to]) => [now - to, now - from]);
     const firstMeet = /처음\s*(만났|봤)|첫\s*만남|first\s+(met|time\s+we\s+met)/iu.test(latest);
     const place = state.clock.place ?? findEntities(lastTwo).place[0] ?? null;
-    return { cast: [...cast], persons: found.person, places: found.place, items: found.item, d: state.clock.d, t: state.clock.t, day: state.clock.day, place, ranges, firstMeet, queryText };
+    // 질문은 최신 메시지가 중심이다. 최근 장면은 끝부분만(앞부분을 쓰면 긴 메시지에서 최신 메시지가 잘려 나간다).
+    return { cast: [...cast], persons: found.person, places: found.place, items: found.item, d: state.clock.d, t: state.clock.t, day: state.clock.day, place, ranges, firstMeet, queryText, focusText: latest, contextText: queryText.slice(-1500) };
   }
 
   function sceneHeader(sc) {
@@ -1815,6 +1863,14 @@
     return v;
   }
 
+  /** 질문 벡터: 최신 메시지 0.6 + 최근 장면 끝부분 0.4. 최신 메시지가 짧은 질문이어도 묻히지 않게. */
+  async function sceneVector(sc, cfg) {
+    const focus = clip(sc.focusText.trim(), 1000);
+    if (focus.length < 4 || sc.contextText.endsWith(focus) && sc.contextText.length - focus.length < 40) return queryVector(sc.contextText, cfg);
+    const [f, c] = await Promise.all([queryVector(focus, cfg), queryVector(sc.contextText, cfg)]);
+    return normalize(f.map((x, i) => x * 0.6 + (c[i] ?? 0) * 0.4));
+  }
+
   /**
    * 현재 챗 → (임베딩) 대단원 후보 → 그 안의 메모 후보 → Jev 1회 → 고른 메모
    * dry: true면 회상 횟수 등을 바꾸지 않는다(질문 넣어보기).
@@ -1822,17 +1878,21 @@
   async function recall(entries, visibleHashes, cfg = settings, { dry = false } = {}) {
     const started = Date.now();
     const sc = readScene(entries, cfg);
-    const trace = { at: Date.now(), query: clip(sc.queryText, 400), arcs: [], cands: [], usedJev: false, usedEmbed: false, ms: 0, note: '' };
+    const trace = { at: Date.now(), query: clip(sc.focusText, 400), arcs: [], cands: [], usedJev: false, usedEmbed: false, ms: 0, note: '' };
     const pool = state.events.filter(e => isActive(e) && !visibleHashes.has(e.src));
     if (!pool.length || cfg.recallBudget === 0) { trace.note = pool.length ? '회상 꺼짐' : '아직 꺼낼 메모가 없어요'; return { picks: [], trace, sc }; }
 
     const queryState = (sceneHeader(sc) + entries.slice(-QUERY_MESSAGES).map(e => labelled(e)).join('\n\n')).slice(-MAX_STATE_CHARS);
     let qv = null;
-    try { qv = await queryVector(clip(sc.queryText, 2000), cfg); trace.usedEmbed = true; }
+    try { qv = await sceneVector(sc, cfg); trace.usedEmbed = true; }
     catch (error) { setError('질문 임베딩', error); }
 
-    const qGrams = bigrams(sc.queryText);
+    const qGrams = bigrams(sc.contextText);
+    const fGrams = bigrams(sc.focusText);
+    // 단어 겹침: 최신 메시지와는 양방향(짧은 질문을 메모가 얼마나 덮는지도), 최근 장면과는 약하게
+    const lexOf = (g) => Math.max((coverage(g, fGrams) + coverage(fGrams, g)) / 2, coverage(g, qGrams) * 0.6);
     const named = new Set([...sc.cast, ...sc.persons]);
+    const asked = new Set(findEntities(sc.focusText).person);
     const placeSet = new Set([...sc.places, sc.place].filter(Boolean));
 
     // ── 1단계: 대단원 ──
@@ -1841,7 +1901,7 @@
       const av = vecOf(a);
       const sem = qv && av ? Math.max(0, dot(qv, av)) : 0;
       const castHit = a.cast.filter(n => named.has(n)).length / Math.max(1, Math.min(3, named.size || 1));
-      const lex = coverage(bigrams(a.kw.join(' ') + ' ' + a.places.join(' ')), qGrams);
+      const lex = lexOf(bigrams(a.kw.join(' ') + ' ' + a.places.join(' ')));
       const open = a.id === state.open.arc ? 0.15 : 0;
       const s = (av && qv ? sem * 0.55 : lex * 0.4) + Math.min(1, castHit) * 0.25 + lex * 0.15 + open;
       return { a, s };
@@ -1855,8 +1915,8 @@
     const scored = pool.map(e => {
       const ev = vecOf(e);
       const sem = qv && ev ? Math.max(0, dot(qv, ev)) : 0;
-      const lex = coverage(gramsOf(e), qGrams);
-      const ent = (e.who.some(w => named.has(w)) ? 1 : 0) * 0.6 + (e.place && placeSet.has(e.place) ? 0.4 : 0);
+      const lex = lexOf(gramsOf(e));
+      const ent = (e.who.some(w => named.has(w)) ? 1 : 0) * 0.6 + (e.place && placeSet.has(e.place) ? 0.4 : 0) + (e.who.some(w => asked.has(w)) ? 0.5 : 0);
       const base = (ev && qv ? sem * 0.5 + lex * 0.15 : lex * 0.5) + ent * 0.2 + e.imp * 0.1 + (chosenIds.has(e.arc) ? 0.1 : 0);
       return { e, s: base + (e.pin ? 5 : 0) + (coreOfCast(e) ? 0.15 : 0) + (inRange(e) ? 0.3 : 0) + (sc.firstMeet ? (1 - e.id / (state.seq || 1)) * 0.2 : 0), sem, lex };
     });
@@ -1879,7 +1939,7 @@
         for (const x of cands) {
           q[`m${x.e.id}`] = {
             type: 'noul',
-            instructions: `Is this past memory needed to write the next reply consistently? «${eventLabel(x.e)}»`,
+            instructions: `Needed to answer the latest message or keep the scene consistent? «${eventLabel(x.e)}»`,
           };
         }
         const { answers } = await callJev(queryState, q, cfg);
@@ -1915,7 +1975,7 @@
     }
     // 지금 장면에 나온 인물의 최신 옷·상태는 (원문에서 잘려 나갔다면) 항상 넣는다. 장면이 이어질 때 옷이 바뀌는 실수를 막는다.
     for (const name of sc.cast) {
-      const o = pool.filter(e => e.kind === 'outfit' && e.who[0] === name).sort((a, b) => b.id - a.id)[0];
+      const o = pool.filter(e => e.kind === 'outfit' && e.who[0] === name && e.arc === state.open.arc).sort((a, b) => b.id - a.id)[0];
       if (!o || picks.some(x => x.e === o)) continue;
       const cost = estimateTokens(lineText(o, cfg)) + 6;
       if (cost > budget) continue;
@@ -1941,7 +2001,17 @@
   }
 
   function lineText(e, cfg = settings) {
-    return cfg.injectStyle === 'original' ? e.t : (e.c ?? e.t);
+    const text = cfg.injectStyle === 'original' ? e.t : (e.c ?? e.t);
+    return e.kind === 'outfit' ? outfitSnippet(text) : text;
+  }
+
+  // 옷·상태 메모가 긴 묘사 문장이면 옷·상태가 나온 마디만 남긴다.
+  const WEAR = /(입고|입은|입었|걸치|걸친|벗|옷|셔츠|블라우스|치마|스커트|바지|반바지|드레스|교복|정장|잠옷|속옷|원피스|코트|외투|재킷|자켓|후드|니트|스타킹|양말|신발|구두|운동화|부츠|맨발|모자|안경|장갑|목도리|머리띠|리본|앞치마|수영복|비키니|젖은|젖어|찢어|다친|붕대|wearing|wore|dress|shirt|skirt|pants|jacket|coat|shoes|uniform)/iu;
+  function outfitSnippet(text) {
+    if (text.length <= 100) return text;
+    const parts = text.split(/(?<=[,.!?])\s+|(?<=(?:며|면서|고|채))\s+/u).filter(Boolean);
+    const keep = parts.filter(p => WEAR.test(p));
+    return clip((keep.length ? keep : parts.slice(0, 1)).join(' '), 140);
   }
 
   function formatMemories(picks, sc, cfg = settings) {
@@ -3103,7 +3173,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, splitRaw, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
