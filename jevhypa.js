@@ -1388,6 +1388,9 @@
     return false;
   }
 
+  /** 원본 메시지를 셀 때: 원본 번호·글 키·느슨한 키 중 하나라도 있으면 정리된 것. 새 키를 적지는 않는다. */
+  const seenAny = (e) => seenSet.has(e.key) || (!!e.loose && seenSet.has(e.loose)) || (!!e.hash && seenSet.has(e.hash));
+
   function markSeen(e) {
     seenSet.add(e.key);
     if (e.loose) seenSet.add(e.loose);
@@ -1395,21 +1398,21 @@
 
   function lastSeenIndex(list) {
     let last = -1;
-    list.forEach((e, i) => { if (seenSet.has(e.key)) last = i; });
+    list.forEach((e, i) => { if (seenSet.has(e.key)) last = i; }); // 순서 꼬임은 원본 번호로만 본다(같은 글 "응."이 여러 개여도 헷갈리지 않게)
     return last;
   }
 
   /** 앞에 처리 안 된 메시지가 있는데 그 뒤가 처리돼 있으면 순서가 꼬인 것. 꼬인(앞부분) 개수. */
   function orderGap(raw) {
     const list = raw.slice(0, Math.max(0, raw.length - SETTLE));
-    return list.slice(0, lastSeenIndex(list) + 1).filter(e => !seenSet.has(e.key)).length;
+    return list.slice(0, lastSeenIndex(list) + 1).filter(e => !seenAny(e)).length; // 같은 글로 이미 정리된 건 빈칸이 아니다
   }
 
   /** 다음에 처리할 메시지들(오래된 순). 순서가 꼬였으면 마지막으로 처리한 것 이후만. */
   function ingestTargets(raw) {
     const list = raw.slice(0, Math.max(0, raw.length - SETTLE));
     const from = orderGap(raw) ? lastSeenIndex(list) + 1 : 0;
-    return list.slice(from).filter(e => !seenSet.has(e.key));
+    return list.slice(from).filter(e => !seenAny(e)); // 요청으로 이미 정리된 것(글 내용 키)도 빼고 센다
   }
 
   function refreshPending() {
@@ -3208,7 +3211,7 @@
     return `${statusBanner()}
       <div class="grid">${kpi(active.length, '사건 메모')}${kpi(state.scenes.length, '장면')}${kpi(state.arcs.length, '대단원')}${kpi(fmtTokens(last?.injectedTokens ?? 0), '마지막 주입 토큰')}</div>
       ${state.gap ? `<div class="banner bad"><div class="g"><b>앞부분 ${state.gap}개가 정리 안 됐어요</b><div class="small muted">뒷부분이 먼저 정리돼서 이야기 순서가 꼬였어요. 처음부터 다시 정리하면 순서대로 맞춰져요. (사전은 남아요)</div></div><button class="btn p" data-act="process-all" data-rebuild="1">처음부터 다시 정리</button></div>` : ''}
-      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 정리 안 된 메시지 ${state.pending}개</b><div class="small muted">대화할 때마다 오래된 것부터 조금씩 정리돼요. Risu가 보내지 않은 것 중 아직 정리 안 된 건 원문으로 잠깐 넣어요.</div></div><button class="btn" data-act="process-all">지금 전부 처리</button></div>` : ''}
+      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 메모로 안 만든 메시지 ${state.pending}개</b><div class="small muted">보통은 답장을 받을 때마다 알아서 메모가 돼요. 플러그인을 깔기 전 대화이거나 오류로 밀린 거면 '지금 전부 처리'를 누르세요.</div></div><button class="btn" data-act="process-all">지금 전부 처리</button></div>` : ''}
       ${ui.progress ? `<div class="card small">${escapeHtml(ui.progress)}</div>` : ''}
       <div class="sec">지금</div>
       <div class="card">
