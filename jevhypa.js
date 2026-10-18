@@ -85,7 +85,7 @@
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
     injectMode: 'last_user', injectStyle: 'memo', injectLabel: 'Memory', note: DEFAULT_NOTE, showStoryTime: true,
-    cards: true, bonds: true, autoCatchUp: true,
+    cards: true, bonds: true, autoCatchUp: true, intimacy: false,
     translate: 'off', translateKey: '', translateModel: 'google/gemini-2.5-flash-lite',
     showButton: true,
   };
@@ -693,6 +693,7 @@
       showStoryTime: bool('showStoryTime'),
       cards: bool('cards'),
       bonds: bool('bonds'),
+      intimacy: s.intimacy === true,
       autoCatchUp: bool('autoCatchUp'),
       translate: TRANSLATORS[s.translate] ? s.translate : 'off',
       translateKey: cleanKey(str(s.translateKey)),
@@ -1227,6 +1228,15 @@
       state.bonds[nk] = cur ? { ...bd, ...cur, a, b, hist: [...bd.hist, ...cur.hist].slice(-12) } : { ...bd, a, b };
     }
     if (state.people?.[name]) { state.people[target] ??= state.people[name]; delete state.people[name]; }
+    for (const [k, rec] of Object.entries(state.intimacy ?? {})) {
+      const [x, y] = k.split('|');
+      if (x !== name && y !== name) continue;
+      delete state.intimacy[k];
+      const nx = x === name ? target : x, ny = y === name ? target : y;
+      if (nx === ny) continue;
+      const nk = pairId(nx, ny), cur = state.intimacy[nk];
+      state.intimacy[nk] = cur ? { n: cur.n + rec.n, first: cur.first ?? rec.first, last: rec.last ?? cur.last, scenes: [...new Set([...cur.scenes, ...rec.scenes])].slice(-60) } : rec;
+    }
     state.dict.sug = state.dict.sug.filter(s => !(s.from === name && s.to === target));
     matcherCache = null;
     recallCache.clear();
@@ -1978,6 +1988,7 @@
   const MOOD_LABEL = { calm: '평온', happy: '기쁨', excited: '들뜸', affectionate: '애정', shy: '부끄러움', anxious: '불안', sad: '슬픔', angry: '분노', annoyed: '짜증', tired: '지침', serious: '진지' };
   const MOOD_EMOJI = { calm: '😐', happy: '😊', excited: '😆', affectionate: '🥰', shy: '😳', anxious: '😰', sad: '😢', angry: '😠', annoyed: '😒', tired: '😩', serious: '🧐' };
   const AXIS_MAX = 5;
+  const INTIMACY_P = 0.7;   // 관계 횟수: Jev가 이 이상 확신할 때만 센다
   const MAX_PAIRS_PER_BATCH = 3;
   const MAX_MOODS_PER_BATCH = 4;
   const MAX_CLOSE_PER_BATCH = 4;
@@ -1985,6 +1996,14 @@
   const MOOD_FRESH_TURNS = 30;
 
   const bondKey = (a, b) => `${a}→${b}`;
+  const pairId = (a, b) => [a, b].sort().join('|');
+  /** 짝(방향 없음)의 관계 횟수 기록 */
+  function intimacyOf(a, b, create = false) {
+    state.intimacy ??= {};
+    const k = pairId(a, b);
+    if (!state.intimacy[k] && create) state.intimacy[k] = { n: 0, first: null, last: null, scenes: [] };
+    return state.intimacy[k] ?? null;
+  }
   const isPerson = (n) => !!n && state.dict.e[n]?.type === 'person' && !state.dict.e[n].alias;
   const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const aliasesOf = (n) => Object.entries(state.dict.e).filter(([, x]) => x.alias === n).map(([k]) => k);
@@ -2125,6 +2144,10 @@
         q[`g${i}`] = { type: 'choice', instructions: `What is the relationship between ${a} and ${b} now?`, criteria: BOND_TYPES };
       }
     });
+    if (settings.intimacy) pairs.forEach(([a, b], i) => {
+      if (state.bonds?.[bondKey(a, b)]?.off || state.bonds?.[bondKey(b, a)]?.off) return;
+      q[`q${i}`] = { type: 'noul', instructions: `In this part, did ${a} and ${b} actually have sex with each other? Count only what happens now in the story, not a memory, dream, fantasy, plan, joke, or refusal.` };
+    });
     moodsFor.forEach((n, i) => { q[`h${i}`] = { type: 'choice', instructions: `How does ${n} feel at the end of this part?`, criteria: MOODS }; });
     closes.forEach((p, i) => { q[`l${i}`] = { type: 'noul', instructions: `Does NEW fulfill, cancel, or end the plan or promise in OLD?\nOLD: «${p.old.t}»\nNEW: «${p.neu.t}»` }; });
     return q;
@@ -2166,6 +2189,19 @@
         bond.type = ty;
       }
     });
+    // 관계 횟수: 같은 장면은 한 번만 센다
+    if (settings.intimacy) pairs.forEach(([a, b], i) => {
+      if (!B[`q${i}`] || noulProb(B[`q${i}`]) < INTIMACY_P) return;
+      const scene = evidence(a, b)?.scene ?? state.open.scene;
+      const rec = intimacyOf(a, b, true);
+      if (scene != null && rec.scenes.includes(scene)) return;
+      rec.n++;
+      const when = evidence(a, b)?.when ?? nowWhen();
+      rec.first ??= when;
+      rec.last = when;
+      if (scene != null) rec.scenes = [...rec.scenes, scene].slice(-60);
+      for (const [x, y] of [[a, b], [b, a]]) if (rec.n === 1) bondHistory(bondOf(x, y), '첫 관계', evidence(a, b));
+    });
     moodsFor.forEach((n, i) => {
       const p = choiceProbs(B[`h${i}`], Object.keys(MOODS));
       const m = argmax(p);
@@ -2184,6 +2220,8 @@
     if (bond.trust) bits.push(`trust ${bond.trust > 0 ? '+' : ''}${bond.trust}`);
     if (bond.term) bits.push(`calls "${bond.term}"`);
     if (bond.polite) bits.push(bond.polite);
+    const im = settings.intimacy ? state.intimacy?.[pairId(bond.a, bond.b)] : null;
+    if (im?.n) bits.push(`intimate ×${im.n}`);
     return bits.length ? `→${bond.b}: ${bits.join(', ')}` : '';
   }
 
@@ -2199,7 +2237,7 @@
       }
     }
     const bonds = Object.values(state.bonds ?? {}).filter(bd => bd.a === name && !bd.off && featured.has(bd.b) && bd.b !== name);
-    const ranked = bonds.map(bd => ({ bd, w: (bd.type ? 2 : 0) + Math.abs(bd.aff) + Math.abs(bd.trust) + (bd.term ? 1 : 0) }))
+    const ranked = bonds.map(bd => ({ bd, w: (bd.type ? 2 : 0) + Math.abs(bd.aff) + Math.abs(bd.trust) + (bd.term ? 1 : 0) + (settings.intimacy && state.intimacy?.[pairId(bd.a, bd.b)]?.n ? 2 : 0) }))
       .filter(x => x.w > 0).sort((a, b) => b.w - a.w).slice(0, 3);
     for (const { bd } of ranked) { const s = bondPhrase(bd); if (s) parts.push(s); }
     return parts.join(' · ');
@@ -2801,6 +2839,7 @@
     .tval.zero{color:var(--textcolor2,#8d909a);font-weight:400}
     .tval.t.pos{color:#5fc28f}
     .tbadges{margin-top:auto;display:flex;gap:6px;align-items:center;min-height:18px}
+    .tint{font-size:12px;font-weight:600;color:#e8739d}
     .sheet-bg{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px}
     .sheet{width:100%;max-width:480px;max-height:86vh;overflow:auto;background:var(--bgcolor,#121317);border:1px solid var(--borderc,#2c2e36);border-radius:14px;padding:12px}
     .sheet .card{margin-bottom:0}
@@ -3304,6 +3343,14 @@
 
   const pairOff = (p) => !!(p.ab?.off || p.ba?.off);
 
+  function intimacyRow(p) {
+    const rec = state.intimacy?.[pairKey(p)];
+    const n = rec?.n ?? 0;
+    const da = `data-a="${escapeHtml(p.a)}" data-b="${escapeHtml(p.b)}"`;
+    const span = rec?.first ? ` · 처음 ${escapeHtml(formatWhen(rec.first, true) || '?')}${rec.last && n > 1 ? ` · 최근 ${escapeHtml(formatWhen(rec.last, true) || '?')}` : ''}` : '';
+    return `<div class="dir"><div class="ax"><span class="small muted">관계 횟수</span><button class="btn sm ic" data-act="bond-int" ${da} data-d="-1" aria-label="관계 횟수 −1">−</button><span class="num gv">${n}</span><button class="btn sm ic" data-act="bond-int" ${da} data-d="1" aria-label="관계 횟수 +1">+</button><span class="small muted">${span}</span></div></div>`;
+  }
+
   function bondCard(p) {
     const type = p.ab?.type || p.ba?.type || '';
     const pin = !!(p.ab?.pin || p.ba?.pin);
@@ -3329,6 +3376,7 @@
           <button class="btn sm${pin ? ' p' : ''}" data-act="bond-pin" ${da} title="${pin ? '자동 변경 잠금 풀기' : '지금 값을 고정: 대화가 이어져도 자동으로 바뀌지 않아요'}"${off ? ' disabled' : ''}>${pin ? '🔒 값 고정됨' : '🔓 값 고정'}</button>
         </div>
         ${dirRow(p.ab, p.a, p.b)}${dirRow(p.ba, p.b, p.a)}
+        ${settings.intimacy ? intimacyRow(p) : ''}
         <div class="small muted" style="margin-top:6px">${first ? `처음: ${escapeHtml([formatWhen(first.when, true), first.place].filter(Boolean).join(' · ') || '기록 없음')}` : ''}${last ? ` · 최근: ${escapeHtml(formatWhen(last, true))}` : ''}</div>
         ${hist.length ? `<details style="margin-top:6px"${keepOpen(`hist:${p.a}|${p.b}`, false)}><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
       </div>
@@ -3362,7 +3410,7 @@
       <div class="tnames"><b>${escapeHtml(p.a)}</b><span class="tx">⇄</span><b>${escapeHtml(p.b)}</b></div>
       <div class="ttype">${type ? escapeHtml(BOND_LABEL[type]) : '<span class="muted">종류 모름</span>'}</div>
       ${dir(p.ab, p.a)}${dir(p.ba, p.b)}
-      <div class="tbadges">${pin ? '<span title="값 고정">🔒</span>' : ''}${off ? '<span class="state-pill off">꺼짐</span>' : ''}</div>
+      <div class="tbadges">${settings.intimacy && state.intimacy?.[pairKey(p)]?.n ? `<span class="tint" title="관계 횟수">💞 ×${state.intimacy[pairKey(p)].n}</span>` : ''}${pin ? '<span title="값 고정">🔒</span>' : ''}${off ? '<span class="state-pill off">꺼짐</span>' : ''}</div>
     </button>`;
   }
 
@@ -3469,6 +3517,7 @@
         ${field('메모 압축', '말버릇을 빼고, 메모가 처음 쓰일 때 Jev가 원문에서 필요한 단어만 골라 짧게 만들어요. 원문은 보관돼요.', sw('compress', d.compress))}
         ${field('카드로 정리', '메모마다 형식(말·규칙·소문…), 지금도 유효한지, 누구 얘기인지, 앞 문장을 Jev로 붙여요. 메모당 Jev 문항이 2~3개 늘어요.', sw('cards', d.cards))}
         ${field('채팅 열 때 밀린 메시지 정리', '채팅을 열면 아직 정리 안 된 메시지를 뒤에서 바로 정리해요(한 번에 최대 300개). 정리 안 된 메시지는 원문으로 보내야 해서 토큰을 먹어요. 아주 긴 채팅은 처음 한 번 Jev 비용이 들어요.', sw('autoCatchUp', d.autoCatchUp))}
+        ${field('관계 횟수 기록 (성관계)', '두 사람이 실제로 관계를 가진 장면을 Jev가 골라 짝마다 횟수·처음·최근 날짜를 남겨요. 같은 장면은 한 번만 세고, 회상·꿈·상상·계획은 빼요. 관계 탭 타일에 💞로 보이고, 메모의 관계 줄에도 들어가요. 관계·기분 추적이 켜져 있어야 해요.', sw('intimacy', d.intimacy))}
         ${field('관계·기분 추적', '누가 누구를 어떻게 부르는지(호칭·존댓말), 사이가 가까워졌는지 멀어졌는지, 기분과 마지막 위치를 쌓아요. 관계 탭에서 보고 고칠 수 있고, 지금 장면 사람의 관계가 메모에 한 줄로 들어가요. 저장할 때 Jev 문항이 몇 개 늘어요.', sw('bonds', d.bonds))}
         ${field('바뀐 기억 정리', '새 메모가 옛 메모를 뒤집으면 옛 것을 "지난 기억"으로 내려요. 같은 말 반복도 걸러요.', sw('supersede', d.supersede))}
       </div>
@@ -3869,11 +3918,20 @@
         await changed(on ? '잠갔어요. 이 관계는 이제 자동으로 바뀌지 않아요.' : '잠금을 풀었어요.');
         return;
       }
+      case 'bond-int': {
+        const { a, b } = el.dataset;
+        const rec = intimacyOf(a, b, true);
+        rec.n = Math.max(0, rec.n + Number(el.dataset.d));
+        if (rec.n > 0) { rec.first ??= nowWhen(); rec.last ??= rec.first; }
+        await changed();
+        return;
+      }
       case 'bond-del': {
         const { a, b } = el.dataset;
         if (!await confirmDialog(`${a} ⇄ ${b} 관계 기록을 지울까요?`, '지우기')) return;
         delete state.bonds[bondKey(a, b)];
         delete state.bonds[bondKey(b, a)];
+        if (state.intimacy) delete state.intimacy[pairId(a, b)];
         ui.bondOpen = null;
         await changed('지웠어요.');
         return;
@@ -3886,6 +3944,7 @@
         for (const x of state.events) x.who = x.who.filter(w => w !== name);
         for (const [k, bd] of Object.entries(state.bonds ?? {})) if (bd.a === name || bd.b === name) delete state.bonds[k];
         if (state.people) delete state.people[name];
+        for (const k of Object.keys(state.intimacy ?? {})) if (k.split('|').includes(name)) delete state.intimacy[k];
         matcherCache = null;
         for (const a of state.arcs) refreshArc(a);
         await changed(`${name}을(를) 뺐어요.`);
@@ -4030,7 +4089,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
