@@ -68,13 +68,6 @@
     custom: { label: '직접 입력', desc: 'OpenAI 형식(/embeddings)을 받는 주소.', format: 'openai', endpoint: '', model: '', key: 'own' },
   };
 
-  const MODES = {
-    risu: { label: 'Risu에 맡기기', badge: '추천', desc: '원문은 Risu가 보낸 그대로 두고, Risu가 보내지 않은 이전 대화만 기억(이 장면 흐름 + 관계 + 회상)으로 채워요. 하이파처럼 쓰려면 프롬프트 템플릿의 채팅 범위를 최근 2개 정도로 두세요.', rawBudget: 200000, minRaw: 100, recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3 },
-    save: { label: '절약', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 원문을 적게, 메모도 짧게.', rawBudget: 3000, minRaw: 4, recallBudget: 700, eventsPerScene: 2, candidates: 16, arcs: 2 },
-    balanced: { label: '균형', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 최근 대화를 넉넉히 원문으로.', rawBudget: 6000, minRaw: 6, recallBudget: 1200, eventsPerScene: 4, candidates: 24, arcs: 3 },
-    quality: { label: '품질', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 원문도 메모도 넉넉히.', rawBudget: 12000, minRaw: 10, recallBudget: 2000, eventsPerScene: 6, candidates: 40, arcs: 4 },
-  };
-  const MODE_KEYS = ['rawBudget', 'minRaw', 'recallBudget', 'eventsPerScene', 'candidates', 'arcs'];
 
   // 메인 모델에게 하는 안내. 영어가 토큰이 적게 든다(한국어 문장의 약 1/3).
   const DEFAULT_NOTE = 'Auto-extracted notes from earlier chat; words were picked, so grammar may be choppy. Infer the meaning. If they conflict with the current chat, the current chat wins.';
@@ -87,7 +80,7 @@
     // 주소·모델은 비워 두면 고른 프리셋 값으로 채워진다(sanitizeSettings)
     jevPreset: 'openrouter', jevKey: '', jevEndpoint: '', jevModel: '',
     embedPreset: 'openrouter', embedKey: '', embedEndpoint: '', embedModel: '', embedDims: 512,
-    mode: 'risu', ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES.risu[k]])),
+    recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3,
     recallThreshold: 50, saveThreshold: 55,
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
@@ -674,10 +667,7 @@
       embedEndpoint: str(s.embedEndpoint),
       embedModel: str(s.embedModel),
       embedDims: clampNum(s.embedDims, 512, 64, 4096),
-      mode: MODES[s.mode] || s.mode === 'custom' ? s.mode : 'risu',
-      rawBudget: clampNum(s.rawBudget, 200000, 0, 200000),
-      minRaw: clampNum(s.minRaw, 100, 2, 100),
-      recallBudget: clampNum(s.recallBudget, 1200, 0, 20000),
+      recallBudget: clampNum(s.recallBudget, 1400, 0, 20000),
       eventsPerScene: clampNum(s.eventsPerScene, 4, 1, 20),
       candidates: clampNum(s.candidates, 24, 4, 200),
       arcs: clampNum(s.arcs, 3, 1, 10),
@@ -730,11 +720,6 @@
     if (embedProfile(settings) !== before) { queryVecCache.clear(); vecCache.clear(); }
     recallCache.clear();
     await syncButton();
-  }
-
-  function applyMode(draft, mode) {
-    if (!MODES[mode]) return { ...draft, mode: 'custom' };
-    return { ...draft, mode, ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES[mode][k]])) };
   }
 
   // ══════════════════════════════════════════════════════════════════════
@@ -2610,19 +2595,6 @@
   let job = null;           // 백그라운드 작업 (하나만)
   let busy = false;
 
-  /** 원문으로 남길 범위: 최근부터 토큰 예산까지(최소 minRaw개). 그 앞은 "밖". */
-  function splitRaw(entries, cfg) {
-    let tokens = 0;
-    let keep = 0;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const t = estimateTokens(entries[i].text);
-      if (keep >= cfg.minRaw && tokens + t > cfg.rawBudget) break;
-      tokens += t;
-      keep++;
-    }
-    return { outside: entries.slice(0, entries.length - keep), inside: entries.slice(entries.length - keep) };
-  }
-
   const ready = (cfg = settings) => cfg.enabled && !!cfg.jevKey;
 
   async function beforeRequestHandler(messages, type) {
@@ -2638,7 +2610,6 @@
       state.turn = (state.turn ?? 0) + 1;
       if (cfg.rejAutoClear && state.turn - (state.rejClearedTurn ?? 0) >= cfg.rejClearEvery) { rejSet = new Set(); state.rejClearedTurn = state.turn; }
       lastEntries = { key: chatKey, entries, raw };
-      const { outside } = splitRaw(entries, cfg);
       // Risu가 보내지 않은 이전 메시지(프롬프트 템플릿의 채팅 범위 밖)
       const reqKeys = new Set(entries.map(e => e.key));
       const firstSent = raw.findIndex(r => reqKeys.has(r.key));
@@ -2647,9 +2618,9 @@
       // 잘라내야 하는 메시지가 "다음 처리 순서"의 맨 앞이면 지금 처리한다.
       // 더 오래된 메시지가 밀려 있으면 순서를 지키려고 기다린다(그동안은 원문 그대로 보냄).
       if (!job) {
-        const outsideKeys = new Set([...outside, ...notSent].map(e => e.key));
+        const outsideKeys = new Set(notSent.map(e => e.key));
         const now = [];
-        for (const t of (raw.length ? ingestTargets(raw) : outside.filter(e => !isSeen(e)))) {
+        for (const t of (raw.length ? ingestTargets(raw) : [])) {
           if (!outsideKeys.has(t.key)) break;
           now.push(t);
         }
@@ -2661,7 +2632,7 @@
 
       // 원문이 남는 최근 메시지로 이야기 시계(표시용)만 맞춘다
       if (cfg.parseStatus) {
-        for (const e of entries.slice(-cfg.minRaw)) {
+        for (const e of entries.slice(-6)) {
           const s = parseStatus(cleanText(e.text));
           if (s.d) state.clock = { ...state.clock, d: s.d, approx: false };
           if (s.t) state.clock = { ...state.clock, t: s.t };
@@ -2669,15 +2640,7 @@
         }
       }
 
-      const drop = new Set();
-      let droppedTokens = 0;
-      for (const e of outside) {
-        if (!isSeen(e)) break;
-        drop.add(e.index);
-        droppedTokens += estimateTokens(e.text);
-      }
-      const kept = entries.filter(e => !drop.has(e.index));
-      const visible = new Set(kept.flatMap(e => [e.key, e.hash]));
+      const visible = new Set(entries.flatMap(e => [e.key, e.hash])); // Risu가 보낸 메시지의 메모는 넣지 않는다(원문이 이미 있다)
 
       const { picks, trace, sc, bridge } = await recall(entries, visible, cfg);
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
@@ -2692,12 +2655,11 @@
       }
       const block = await translateBlock(formatMemories(picks, sc, cfg, bridge, unsent), cfg);
       const injectedTokens = block ? estimateTokens(block) : 0;
-      state.savedTokens = (state.savedTokens ?? 0) + Math.max(0, droppedTokens - injectedTokens);
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
       refreshPending();
-      state.lastRecall = { ...trace, trimmed: drop.size, kept: kept.length, droppedTokens, injectedTokens, preview: block, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
+      state.lastRecall = { ...trace, kept: entries.length, notSent: notSent.length, unsent: unsent.length, injectedTokens, preview: block, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
       void persist();
-      return inject(messages.filter((_, i) => !drop.has(i)), block, cfg);
+      return inject(messages, block, cfg);
     } catch (error) {
       setError('요청 처리', error);
       return messages;
@@ -3035,11 +2997,6 @@
       <div class="row"><button class="btn" data-act="test-embed">연결 테스트</button>${testLine('embed')}</div>`;
   }
 
-  function modeFields(d) {
-    return `<div class="opts">${Object.entries(MODES).map(([k, v]) => opt('mode', k, d.mode, v.label, v.desc, v.badge)).join('')}</div>
-      ${d.mode === 'custom' ? '<div class="help" style="margin-top:6px">직접 바꾼 값을 쓰는 중이에요.</div>' : ''}`;
-  }
-
   function testLine(which) {
     const t = ui.test[which];
     if (!t) return '';
@@ -3061,8 +3018,8 @@
       return `${steps}<h3 style="margin:0 0 4px">2. 임베딩 고르기</h3><p class="muted small" style="margin:0 0 12px">임베딩은 "뜻이 비슷한 기억"을 빠르게 찾는 데 써요. 단어가 달라도 같은 얘기면 찾아요. 모르겠으면 첫 번째를 고르세요.</p>
         <div class="card">${embedFields(d)}</div>${nav(true, 'wiz-next')}`;
     }
-    return `${steps}<h3 style="margin:0 0 4px">3. 얼마나 아낄까요?</h3><p class="muted small" style="margin:0 0 12px">나중에 설정에서 언제든 바꿀 수 있어요.</p>
-      <div class="card">${modeFields(d)}</div>
+    return `${steps}<h3 style="margin:0 0 4px">3. 이렇게 써요</h3><p class="muted small" style="margin:0 0 12px">JevHypa는 Risu가 보낸 원문은 건드리지 않고, 보내지 않은 이전 대화만 메모로 채워요.</p>
+      <div class="card small">토큰을 아끼려면 Risu 설정에서 <b>최대 컨텍스트</b>를 줄이거나, 프롬프트 템플릿의 <b>채팅 범위</b>를 최근 2~10개로 두세요. 그보다 오래된 대화는 JevHypa가 짧은 메모로 대신 넣어요.<br><br>Risu 자체 메모리(하이파·수파)는 꺼 두세요. 요약이 두 번 들어가요.</div>
       <div class="card small muted">이렇게 동작해요<br>· 최근 대화는 원문 그대로 보내요.<br>· 그보다 오래된 대화는 <b>장면 → 대단원</b>으로 묶어 중요한 사건 메모만 남기고 원문은 요청에서 빼요.<br>· 매 턴 지금 장면에 필요한 메모만 골라 넣어요.</div>
       ${nav(true, 'wiz-finish', '시작하기')}`;
   }
@@ -3079,7 +3036,7 @@
     }
     const embedStale = state.events.some(e => e.vp !== embedProfile());
     if (embedStale) return `<div class="banner warn"><div class="g"><b>임베딩 다시 계산 필요</b><div class="small muted">임베딩 설정이 바뀌었거나 일부 메모에 벡터가 없어요. 그동안은 단어 겹침으로 찾아요.</div></div><button class="btn p" data-act="reembed">지금 계산</button></div>`;
-    return `<div class="banner ok"><div class="g"><b>작동 중</b><div class="small muted">${MODES[settings.mode]?.label ?? '직접 설정'} 모드 · 최근 약 ${settings.rawBudget.toLocaleString()}토큰은 원문, 그 이전은 메모로</div></div><button class="btn" data-act="toggle-chat">이 채팅에서 끄기</button></div>`;
+    return `<div class="banner ok"><div class="g"><b>작동 중</b><div class="small muted">Risu가 보낸 원문은 그대로 두고, 보내지 않은 이전 대화만 메모로 넣어요</div></div><button class="btn" data-act="toggle-chat">이 채팅에서 끄기</button></div>`;
   }
 
   function renderHome() {
@@ -3094,9 +3051,9 @@
       return e ? `<div class="row" style="padding:5px 0;border-bottom:1px solid var(--borderc,#2c2e36);flex-wrap:nowrap"><span class="ok num" style="width:42px">${Math.round(p.p * 100)}%</span><span class="chip k">${KINDS[e.kind]?.label}</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(lineText(e))}</span></div>` : '';
     }).join('');
     return `${statusBanner()}
-      <div class="grid">${kpi(active.length, '사건 메모')}${kpi(state.scenes.length, '장면')}${kpi(state.arcs.length, '대단원')}${kpi(fmtTokens(state.savedTokens ?? 0), '아낀 토큰(추정)')}</div>
+      <div class="grid">${kpi(active.length, '사건 메모')}${kpi(state.scenes.length, '장면')}${kpi(state.arcs.length, '대단원')}${kpi(fmtTokens(last?.injectedTokens ?? 0), '마지막 주입 토큰')}</div>
       ${state.gap ? `<div class="banner bad"><div class="g"><b>앞부분 ${state.gap}개가 정리 안 됐어요</b><div class="small muted">뒷부분이 먼저 정리돼서 이야기 순서가 꼬였어요. 처음부터 다시 정리하면 순서대로 맞춰져요. (사전은 남아요)</div></div><button class="btn p" data-act="process-all" data-rebuild="1">처음부터 다시 정리</button></div>` : ''}
-      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 정리 안 된 메시지 ${state.pending}개</b><div class="small muted">대화할 때마다 오래된 것부터 조금씩 정리돼요. 다 정리되기 전에는 원문을 자르지 않아요.</div></div><button class="btn" data-act="process-all">지금 전부 처리</button></div>` : ''}
+      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 정리 안 된 메시지 ${state.pending}개</b><div class="small muted">대화할 때마다 오래된 것부터 조금씩 정리돼요. Risu가 보내지 않은 것 중 아직 정리 안 된 건 원문으로 잠깐 넣어요.</div></div><button class="btn" data-act="process-all">지금 전부 처리</button></div>` : ''}
       ${ui.progress ? `<div class="card small">${escapeHtml(ui.progress)}</div>` : ''}
       <div class="sec">지금</div>
       <div class="card">
@@ -3105,7 +3062,7 @@
       </div>
       <div class="sec">마지막 회상 ${last ? `<span class="small" style="font-weight:400">· ${timeAgo(last.at)} · ${last.ms}ms</span>` : ''}</div>
       ${last ? `<div class="card">
-        <div class="row small muted" style="gap:14px"><span>원문 ${last.kept}개 유지</span><span>${last.trimmed}개 메모로 대체 (~${last.droppedTokens}토큰)</span><span>메모 ${last.picks.length}개 주입 (~${last.injectedTokens}토큰)</span><span>${last.usedEmbed ? '임베딩 ✓' : '임베딩 ✕'} · ${last.usedJev ? 'Jev ✓' : '<span class="err">Jev ✕</span>'}</span></div>
+        <div class="row small muted" style="gap:14px"><span>Risu가 보낸 원문 ${last.kept}개</span><span>안 보낸 이전 메시지 ${last.notSent ?? 0}개${last.unsent ? ` (정리 전 원문 ${last.unsent}개)` : ''}</span><span>메모 ${last.picks.length}개 주입 (~${last.injectedTokens}토큰)</span><span>${last.usedEmbed ? '임베딩 ✓' : '임베딩 ✕'} · ${last.usedJev ? 'Jev ✓' : '<span class="err">Jev ✕</span>'}</span></div>
         <div style="margin-top:8px">${picks || `<div class="small muted">${escapeHtml(last.note || '이번엔 넣을 만한 메모가 없었어요.')}</div>`}</div>
         <div class="row" style="margin-top:8px"><button class="btn sm" data-act="tab" data-tab="trace">자세히 보기</button></div>
       </div>` : '<div class="card small muted">이 채팅에서 메시지를 보내면 여기에 무엇을 넣었는지 보여요.</div>'}
@@ -3411,13 +3368,12 @@
     let base = lastEntries?.key === chatKey ? lastEntries.entries : null;
     if (!base) {
       if (!await ensureChat()) throw new Error('채팅방을 먼저 열어 주세요.');
-      base = rawEntries().slice(-40).map((e, i) => ({ ...e, index: i }));
+      base = rawEntries().slice(-6).map((e, i) => ({ ...e, index: i })); // 아직 요청이 없으면 Risu가 최근 6개쯤 보낸다고 친다
       if (!base.length) throw new Error('채팅 원본을 읽지 못했어요. 채팅방이 열려 있는지 확인해 주세요.');
     }
     const dryHash = hashText('dry\u0000' + text);
     const entries = [...base, { index: -1, role: 'user', text, hash: dryHash, key: `h:${dryHash}` }];
-    const { outside } = splitRaw(entries, settings);
-    const visible = new Set(entries.filter(e => !outside.includes(e) || !isSeen(e)).flatMap(e => [e.key, e.hash]));
+    const visible = new Set(entries.flatMap(e => [e.key, e.hash]));
     const { picks, trace, sc, bridge } = await recall(entries, visible, settings, { dry: true });
     const preview = await translateBlock(formatMemories(picks, sc, settings, bridge), settings);
     return { ...trace, preview, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
@@ -3431,17 +3387,15 @@
     const num = (k, min, max) => `<input class="inp" type="number" inputmode="numeric" min="${min}" max="${max}" data-field="${k}" value="${escapeHtml(d[k])}">`;
     return `<div class="sec">Jev 연결</div><div class="card">${jevFields(d)}</div>
       <div class="sec">임베딩</div><div class="card">${embedFields(d)}</div>
-      <div class="sec">모드</div><div class="card">${modeFields(d)}
-        <details${keepOpen('nums', d.mode === 'custom')}><summary>숫자로 직접 조절</summary>
-          ${field('원문 예산 (토큰)', '최근 대화를 이만큼 원문으로 보내요. 그보다 오래된 건 메모로 대체돼요.', num('rawBudget', 0, 200000))}
-          ${field('원문 최소 개수', '예산과 상관없이 최근 이만큼은 꼭 원문으로.', num('minRaw', 2, 100))}
+      <div class="sec">기억 주입</div><div class="card">
+        <div class="help" style="margin-bottom:8px">원문은 Risu가 보낸 그대로 두고, Risu가 보내지 않은 이전 대화만 메모로 넣어요. 토큰을 더 아끼려면 Risu의 최대 컨텍스트나 프롬프트 템플릿의 채팅 범위를 줄이세요(예: 최근 2~10개).</div>
           ${field('메모 주입 예산 (토큰)', '0이면 회상을 끕니다.', num('recallBudget', 0, 20000))}
           ${field('장면당 메모 수', '장면마다 중요한 사건 몇 개만 남길지. 적을수록 쓸모없는 메모가 줄어요.', num('eventsPerScene', 1, 20))}
           ${field('Jev 후보 수', '매 턴 Jev에게 물어볼 메모 수.', num('candidates', 4, 200))}
           ${field('대단원 후보 수', '먼저 고를 대단원 수.', num('arcs', 1, 10))}
           ${field('회상 기준 (%)', 'Jev가 "필요"라고 본 확률이 이 이상이면 넣어요. 등장인물의 인물정보·관계·약속·비밀은 기준을 낮춰 줘요.', num('recallThreshold', 1, 99))}
           ${field('저장 기준 (%)', '"잡담·사소함"이 아니라고 본 확률이 이 이상인 문장만 메모 후보가 돼요.', num('saveThreshold', 1, 99))}
-        </details></div>
+        </div>
       <div class="sec">추출 · 정리</div><div class="card">
         ${field('대사 줄에서 이름 뽑기', '이름(억양): "대사" 같은 줄이 있으면 화자를 인물로 등록해요.', sw('parseSpeakers', d.parseSpeakers))}
         ${field('상태줄에서 날짜·장소 뽑기', '2023-04-03 ◆ 09:15 ◆ 장소 같은 줄이 있으면 읽어요. 없으면 Jev가 시간 흐름을 판단해 N일차로 세요.', sw('parseStatus', d.parseStatus))}
@@ -3510,7 +3464,6 @@
       else if (el.type === 'number' || k === 'embedDims') d[k] = Number(el.value);
       else d[k] = el.value;
     }
-    if (MODE_KEYS.some(k => d[k] !== base[k]) && d.mode !== 'custom' && MODES[d.mode] && MODE_KEYS.some(k => d[k] !== MODES[d.mode][k])) d.mode = 'custom';
     return d;
   }
 
@@ -3529,7 +3482,6 @@
       const p = EMBED_PRESETS[value];
       return { ...d, embedPreset: value, embedEndpoint: p.endpoint ?? '', embedModel: p.model ?? '' };
     }
-    if (field === 'mode') return applyMode(d, value);
     return { ...d, [field]: value };
   }
 
@@ -4010,7 +3962,7 @@
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
       analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
-      ingest, recall, formatMemories, splitRaw, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
+      ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
     };
