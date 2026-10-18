@@ -762,7 +762,56 @@
     return { endpoint: cfg.jevEndpoint, model: cfg.jevModel, key: cleanKey(cfg.jevKey) };
   }
 
+  // ══ 디버그: 단계별 걸린 시간 (메모리에만, 최근 40건) ══
+  const nowMs = () => (globalThis.performance?.now?.() ?? Date.now());
+  const debugLog = [];
+  const DEBUG_MAX = 40;
+  const traces = { send: null, bg: null };
+  function beginTrace(kind, slot) {
+    const tr = { kind, at: Date.now(), t0: nowMs(), steps: [], calls: [], ms: 0, note: '' };
+    traces[slot] = tr;
+    return tr;
+  }
+  async function timed(tr, name, fn, detail) {
+    const t = nowMs();
+    try { return await fn(); }
+    finally { tr?.steps.push({ name, ms: Math.round(nowMs() - t), detail: typeof detail === 'function' ? detail() : (detail ?? '') }); }
+  }
+  function endTrace(tr, slot) {
+    if (!tr) return;
+    tr.ms = Math.round(nowMs() - tr.t0);
+    if (traces[slot] === tr) traces[slot] = null;
+    debugLog.unshift(tr);
+    if (debugLog.length > DEBUG_MAX) debugLog.pop();
+    if (ui.tab === 'debug') { try { if (document.getElementById('bd')) render(); } catch { /* 화면이 닫혀 있으면 그냥 둔다 */ } }
+  }
+  /** 호출의 용도: Jev는 질문 키로, 임베딩은 부른 곳이 알려 준다 */
+  function jevPurpose(questions) {
+    const keys = Object.keys(questions ?? {});
+    if (keys.some(k => /^r\d|^need$|^arc$/.test(k))) return '회상 채점';
+    if (keys.some(k => /^[bfke]\d/.test(k))) return '저장 1단계 (종류·경계)';
+    if (keys.some(k => /^z\d/.test(k))) return '압축';
+    return keys.length ? '저장 2단계 (카드·관계)' : 'Jev';
+  }
+  function recordCall(kind, purpose, ms, size, ok = true) {
+    const forSend = purpose === '회상 채점' || purpose === '임베딩 (질문)';
+    const tr = forSend ? (traces.send ?? traces.bg) : (traces.bg ?? traces.send);
+    tr?.calls.push({ kind, purpose, ms: Math.round(ms), size, ok });
+  }
+
   async function callJev(state, questions, cfg = settings) {
+    const t = nowMs();
+    try {
+      const out = await callJevOnce(state, questions, cfg);
+      recordCall('jev', jevPurpose(questions), nowMs() - t, Object.keys(questions ?? {}).length);
+      return out;
+    } catch (error) {
+      recordCall('jev', jevPurpose(questions), nowMs() - t, Object.keys(questions ?? {}).length, false);
+      throw error;
+    }
+  }
+
+  async function callJevOnce(state, questions, cfg = settings) {
     const j = jevConfig(cfg);
     const kp = keyProblem(j.key, 'Jev');
     if (kp) throw new Error(kp);
@@ -862,7 +911,20 @@
     return normalize(v);
   }
 
-  async function embedTexts(texts, cfg = settings) {
+  async function embedTexts(texts, cfg = settings, purpose = '') {
+    const t = nowMs();
+    const label = purpose || `임베딩 (메모 ${texts.length}개)`;
+    try {
+      const out = await embedTextsOnce(texts, cfg);
+      if (embedConfig(cfg).format !== 'local') recordCall('embed', label, nowMs() - t, texts.length);
+      return out;
+    } catch (error) {
+      recordCall('embed', label, nowMs() - t, texts.length, false);
+      throw error;
+    }
+  }
+
+  async function embedTextsOnce(texts, cfg = settings) {
     const e = embedConfig(cfg);
     if (e.format === 'local') return texts.map(hashEmbed);
     if (e.needsKey || e.key) { const kp = keyProblem(e.key, '임베딩'); if (kp) throw new Error(kp); }
@@ -1043,9 +1105,11 @@
     const show = () => { try { if (document.getElementById('bd')) render(); } catch { /* 화면이 닫혀 있으면 그냥 둔다 */ } };
     ui.progress = `밀린 메시지 정리 중 · 0/${todo.length}`;
     show();
-    job = ingest(todo, settings, Infinity, (done) => { ui.progress = `밀린 메시지 정리 중 · ${done}/${todo.length}`; show(); })
+    const tr = beginTrace('catchup', 'bg');
+    let doneN = 0;
+    job = timed(tr, '밀린 메시지 정리', () => ingest(todo, settings, Infinity, (done) => { doneN = done; ui.progress = `밀린 메시지 정리 중 · ${done}/${todo.length}`; show(); }), () => `${doneN}/${todo.length}개`)
       .catch(error => setError('밀린 메시지 정리', error))
-      .finally(() => { job = null; ui.progress = ''; if (chatKey === key) refreshPending(); void persist(); show(); });
+      .finally(() => { endTrace(tr, 'bg'); job = null; ui.progress = ''; if (chatKey === key) refreshPending(); void persist(); show(); });
   }
 
   let saveChain = Promise.resolve();
@@ -2297,7 +2361,7 @@
   async function queryVector(text, cfg) {
     const key = hashText(embedProfile(cfg) + '|' + text);
     if (queryVecCache.has(key)) return queryVecCache.get(key);
-    const [v] = await embedTexts([text], cfg);
+    const [v] = await embedTexts([text], cfg, '임베딩 (질문)');
     queryVecCache.set(key, v);
     if (queryVecCache.size > 30) queryVecCache.delete(queryVecCache.keys().next().value);
     return v;
@@ -2649,8 +2713,10 @@
   async function beforeRequestHandler(messages, type) {
     if ((type !== 'model' && type !== 'main') || busy) return messages;
     busy = true;
+    let tr = null;
     try {
       if (!ready() || !await ensureChat() || state.off) return messages;
+      tr = beginTrace('send', 'send');
       const cfg = settings;
       const entries = chatEntries(messages);
       // 요청에 실린 메시지 중 아직 정리 안 된 것은 받은편지함에 넣는다. 다음 턴에 요청에서 빠져도 놓치지 않게.
@@ -2666,7 +2732,7 @@
         const inReq = new Set(entries.flatMap(e => [e.key, e.loose]));
         const stale = state.inbox.filter(x => !isSeen(x) && !inReq.has(x.key) && !inReq.has(x.loose));
         if (stale.length) {
-          try { await ingest(stale, cfg, 2); } catch (error) { setError('저장', error); }
+          try { await timed(tr, '예비 메모 만들기', () => ingest(stale, cfg, 2), `${stale.length}개`); } catch (error) { setError('저장', error); }
           state.inbox = state.inbox.filter(x => !isSeen(x));
         }
       }
@@ -2686,19 +2752,24 @@
 
       const visible = new Set(entries.flatMap(e => [e.key, e.hash])); // Risu가 보낸 메시지의 메모는 넣지 않는다(원문이 이미 있다)
 
-      const { picks, trace, sc, bridge } = await recall(entries, visible, cfg);
+      const { picks, trace, sc, bridge } = await timed(tr, '회상', () => recall(entries, visible, cfg));
+      tr.steps[tr.steps.length - 1].detail = `후보 ${trace.cands?.length ?? 0} → 메모 ${picks.length}개${trace.need ? ` · 2차 검색(${trace.need})` : ''}${trace.usedJev ? '' : ' · Jev 안 씀'}`;
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
-      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge), cfg);
+      const raw = formatMemories(picks, sc, cfg, bridge);
+      const block = cfg.translate !== 'off' && raw ? await timed(tr, '번역', () => translateBlock(raw, cfg)) : raw;
       const injectedTokens = block ? estimateTokens(block) : 0;
+      tr.note = `메모 블록 ~${injectedTokens}토큰`;
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
       state.lastRecall = { ...trace, kept: entries.length, injectedTokens, preview: block, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
       void persist();
       return inject(messages, block, cfg);
     } catch (error) {
       setError('요청 처리', error);
+      if (tr) tr.note = `오류: ${String(error?.message ?? error).slice(0, 80)}`;
       return messages;
     } finally {
       busy = false;
+      endTrace(tr, 'send');
     }
   }
 
@@ -2708,12 +2779,17 @@
     // 받은편지함(요청에 실렸던, 아직 정리 안 된 메시지)을 오래된 것부터. 바쁘면 다음 턴에 이어서.
     const key = chatKey;
     const pending = (state.inbox ?? []).filter(e => !isSeen(e));
+    const tr = beginTrace('after', 'bg');
     job = (async () => {
-      if (pending.length) await ingest(pending, settings, BACKGROUND_BATCHES);
-      await compressRecalled(settings);
+      if (pending.length) {
+        let done = 0;
+        await timed(tr, '메모 만들기', async () => { done = await ingest(pending, settings, BACKGROUND_BATCHES); }, () => `${done}/${pending.length}개 정리`);
+      }
+      await timed(tr, '압축', () => compressRecalled(settings));
     })()
-      .catch(error => setError('백그라운드 저장', error))
+      .catch(error => { setError('백그라운드 저장', error); tr.note = `오류: ${String(error?.message ?? error).slice(0, 80)}`; })
       .finally(() => {
+        endTrace(tr, 'bg');
         job = null;
         if (chatKey === key) { state.inbox = (state.inbox ?? []).filter(e => !isSeen(e)); state.pending = state.inbox.length; }
         void persist();
@@ -2734,9 +2810,19 @@
    * 지금 전부 처리: Risu 채팅 원본을 처음부터 끝까지(최근 2개 제외) 오래된 순서대로 처리한다.
    * 이미 정리된 기억보다 앞부분이 비어 있으면(순서 꼬임) ORDER_GAP 오류 → rebuild: true로 다시 부른다.
    */
-  async function processAll(onProgress, { rebuild = false } = {}) {
+  async function processAll(onProgress, opts = {}) {
     if (!await ensureChat({ full: true })) throw new Error('채팅방을 먼저 열어 주세요.');
     if (job) await job;
+    const tr = beginTrace('manual', 'bg');
+    let total = 0, doneN = 0;
+    try {
+      await timed(tr, opts.rebuild ? '처음부터 다시 정리' : '지금 전부 처리', () => processAllInner((done, all) => { doneN = done; total = all; onProgress?.(done, all); }, opts), () => `${doneN}/${total}개`);
+    } finally {
+      endTrace(tr, 'bg');
+    }
+  }
+
+  async function processAllInner(onProgress, { rebuild = false } = {}) {
     const raw = rawEntries();
     if (!raw.length) {
       // 원본을 못 읽는 환경이면 마지막 요청에서 본 메시지로라도 처리한다.
@@ -2840,6 +2926,11 @@
     .tval.t.pos{color:#5fc28f}
     .tbadges{margin-top:auto;display:flex;gap:6px;align-items:center;min-height:18px}
     .tint{font-size:12px;font-weight:600;color:#e8739d}
+    .drow{display:grid;grid-template-columns:minmax(90px,140px) 1fr 56px;gap:8px;align-items:center;padding:3px 0}
+    .drow .dd{grid-column:1 / -1;margin:-2px 0 2px}
+    .dtrack{height:8px;border-radius:4px;background:rgba(139,141,151,.15);overflow:hidden}
+    .dbar{display:block;height:100%;border-radius:4px;background:#6b8cff}
+    .dcard .num{text-align:right}
     .sheet-bg{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px}
     .sheet{width:100%;max-width:480px;max-height:86vh;overflow:auto;background:var(--bgcolor,#121317);border:1px solid var(--borderc,#2c2e36);border-radius:14px;padding:12px}
     .sheet .card{margin-bottom:0}
@@ -2928,12 +3019,12 @@
     const body = document.getElementById('bd');
     const keepScroll = body && body.dataset.tab === (ui.wiz ? 'wiz' : ui.tab);
     const scroll = body ? body.scrollTop : 0;
-    const tabs = [['home', '🏠 홈'], ['timeline', '📚 타임라인'], ['people', '👥 인물'], ['bonds', '💞 관계'], ['trace', '🔍 회상 기록'], ['settings', '⚙️ 설정'], ['tools', '🧰 도구']];
+    const tabs = [['home', '🏠 홈'], ['timeline', '📚 타임라인'], ['people', '👥 인물'], ['bonds', '💞 관계'], ['trace', '🔍 회상 기록'], ['settings', '⚙️ 설정'], ['tools', '🧰 도구'], ['debug', '🐞 디버그']];
     document.body.innerHTML = `<style>${CSS}</style>
       <div class="w">
         <div class="hd"><b>🧠 JevHypa</b><span class="sub">${escapeHtml([chatLabel.char, chatLabel.chat].filter(Boolean).join(' · ') || '채팅방을 열면 기억이 보여요')}</span><button class="x" data-act="close" title="닫기">✕</button></div>
         ${ui.wiz ? '' : `<div class="tabs">${tabs.map(([id, l]) => `<button class="tab${ui.tab === id ? ' on' : ''}" data-act="tab" data-tab="${id}">${l}</button>`).join('')}</div>`}
-        <div class="bd" id="bd" data-tab="${ui.wiz ? 'wiz' : ui.tab}"><div class="in">${ui.wiz ? renderWizard() : ({ home: renderHome, timeline: renderTimeline, people: renderPeople, bonds: renderBonds, trace: renderTrace, settings: renderSettings, tools: renderTools }[ui.tab] ?? renderHome)()}</div></div>
+        <div class="bd" id="bd" data-tab="${ui.wiz ? 'wiz' : ui.tab}"><div class="in">${ui.wiz ? renderWizard() : ({ home: renderHome, timeline: renderTimeline, people: renderPeople, bonds: renderBonds, trace: renderTrace, settings: renderSettings, tools: renderTools, debug: renderDebug }[ui.tab] ?? renderHome)()}</div></div>
       </div>
       ${ui.editing ? renderEditor() : ''}`;
     const nb = document.getElementById('bd');
@@ -3454,6 +3545,43 @@
     return ` data-keep="${escapeHtml(key)}"${(ui.keepOpen.get(key) ?? def) ? ' open' : ''}`;
   }
 
+  // ── 디버그 ──
+  const DEBUG_KIND = {
+    send: ['📤 보낼 때', '응답이 이만큼 늦게 시작해요'],
+    after: ['📥 답장 뒤', '뒤에서 해서 기다림 없음'],
+    catchup: ['📂 채팅 열 때 정리', '뒤에서 해서 기다림 없음'],
+    manual: ['🧰 지금 전부 처리', ''],
+  };
+  const secs = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}초` : `${ms}ms`);
+
+  function renderDebug() {
+    const sends = debugLog.filter(t => t.kind === 'send');
+    const bgs = debugLog.filter(t => t.kind !== 'send');
+    const avg = (list) => (list.length ? Math.round(list.reduce((a, t) => a + t.ms, 0) / list.length) : 0);
+    const recent = sends.slice(0, 10);
+    const card = (t) => {
+      const [label, hint] = DEBUG_KIND[t.kind] ?? [t.kind, ''];
+      const max = Math.max(1, ...t.steps.map(x => x.ms));
+      const rows = t.steps.map(x => `<div class="drow"><span class="small">${escapeHtml(x.name)}</span><span class="dtrack"><span class="dbar" style="width:${Math.max(2, Math.round(x.ms / max * 100))}%"></span></span><span class="num small">${secs(x.ms)}</span>${x.detail ? `<span class="small muted dd">${escapeHtml(x.detail)}</span>` : ''}</div>`).join('');
+      const calls = t.calls.length
+        ? `<details style="margin-top:6px"${keepOpen(`dbg:${t.at}`, false)}><summary class="small">호출 ${t.calls.length}번 · Jev ${t.calls.filter(c => c.kind === 'jev').length} · 임베딩 ${t.calls.filter(c => c.kind === 'embed').length}</summary>${t.calls.map(c => `<div class="drow small"><span>${c.kind === 'jev' ? '🤖' : '🧭'} ${escapeHtml(c.purpose)}</span><span class="muted">${c.kind === 'jev' ? `질문 ${c.size}개` : `글 ${c.size}개`}${c.ok ? '' : ' · <span class="err">실패</span>'}</span><span class="num">${secs(c.ms)}</span></div>`).join('')}</details>`
+        : '';
+      return `<div class="card dcard"><div class="row" style="flex-wrap:nowrap"><b style="flex:1">${label}</b><span class="small muted">${timeAgo(t.at)}</span><b class="num">${secs(t.ms)}</b></div>
+        ${hint ? `<div class="small muted">${hint}${t.note ? ` · ${escapeHtml(t.note)}` : ''}</div>` : (t.note ? `<div class="small muted">${escapeHtml(t.note)}</div>` : '')}
+        <div style="margin-top:8px">${rows || '<span class="small muted">할 일이 없었어요.</span>'}</div>${calls}</div>`;
+    };
+    if (!debugLog.length) {
+      return `<div class="card empty"><b>아직 기록이 없어요</b><div class="small muted" style="margin-top:6px">메시지를 보내면 단계마다 몇 초 걸렸는지 여기에 쌓여요. 앱을 다시 열면 비워져요.</div></div>`;
+    }
+    return `<div class="grid">
+        <div class="card" style="margin:0"><div class="kpi">${sends.length ? secs(sends[0].ms) : '-'}</div><div class="small muted">마지막 보낼 때 지연</div></div>
+        <div class="card" style="margin:0"><div class="kpi">${recent.length ? secs(avg(recent)) : '-'}</div><div class="small muted">보낼 때 평균 (최근 ${recent.length}번)</div></div>
+        <div class="card" style="margin:0"><div class="kpi">${bgs.length ? secs(bgs[0].ms) : '-'}</div><div class="small muted">마지막 뒤에서 정리</div></div>
+      </div>
+      <div class="row" style="margin:10px 0"><span class="small muted" style="flex:1">"보낼 때"만 응답을 늦춰요. 나머지는 답장을 받은 뒤 뒤에서 돌아요.</span><button class="btn sm" data-act="debug-clear">기록 지우기</button></div>
+      ${debugLog.map(card).join('')}`;
+  }
+
   function renderTrace() {
     const t = ui.dry ?? state.lastRecall;
     const dryForm = `<div class="card"><b>질문 넣어보기</b><div class="small muted" style="margin:2px 0 8px">이 말을 보내면 어떤 메모가 떠오르는지 미리 봐요. 실제로 보내지는 않아요. (Jev 1회 · 임베딩 1회 사용)</div>
@@ -3899,6 +4027,7 @@
         return;
       }
       case 'ent-confirm': { const x = state.dict.e[el.dataset.name]; if (x) { x.src = 'manual'; x.n = Math.max(x.n, SPEAKER_ACTIVE_COUNT); retagAll(); await changed('인물로 등록했어요.'); } return; }
+      case 'debug-clear': debugLog.length = 0; render(); return;
       case 'rel-focus': ui.relFocus = el.dataset.name || null; render(); return;
       case 'bond-open': ui.bondOpen = el.dataset.key; render(); return;
       case 'bond-close': if (e.target === el) { ui.bondOpen = null; render(); } return; // 바깥 어두운 곳을 눌렀을 때만
@@ -4089,7 +4218,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, renderDebug, debugLog: () => debugLog, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
