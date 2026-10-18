@@ -394,6 +394,13 @@
       for (const raw of line.replace(/^\[|\]$/g, '').split(STATUS_SEP)) {
         const seg = raw.trim();
         if (!seg) continue;
+        const lab = /^([A-Za-z가-힣 ]{2,14})\s*[:：]\s*(.+)$/u.exec(seg);
+        if (lab) {
+          const k = lab[1].trim().toLowerCase(), v = lab[2].trim();
+          if (/weather|날씨/.test(k)) { out.weather ??= v; continue; }
+          if (/location|place|where|area|room|장소|위치|지역/.test(k) && !out.place && v.length >= 2 && v.length <= 30) out.place = v;
+          continue; // Date·Time·HP 같은 다른 이름표는 장소가 아니다
+        }
         if (!out.weather && WEATHER_WORD.test(seg)) { out.weather = WEATHER_WORD.exec(seg)[1]; continue; }
         if (out.place || /\d/.test(seg) || seg.length < 2 || seg.length > 20) continue;
         if (/^\(?[월화수목금토일]\)?(요일)?$/.test(seg) || /^(장소|위치|날씨|시간)\s*[:：]/.test(seg)) continue;
@@ -2717,7 +2724,7 @@
   //  화면
   // ══════════════════════════════════════════════════════════════════════
 
-  const ui = { keepOpen: new Map(), relFocus: null, openDays: new Set(), daysAll: null, arcsAll: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
+  const ui = { bondOpen: null, keepOpen: new Map(), relFocus: null, openDays: new Set(), daysAll: null, arcsAll: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
 
   const CSS = `
     :root{--a:#5b7cfa;--ok:#3fae7a;--warn:#e0a03a;--bad:#e0605a}
@@ -2774,6 +2781,31 @@
     .bond .ax{display:inline-flex;align-items:center;gap:4px}
     .bond.pinned{border-color:#9f7cf2}
     .toggle-card{display:flex;align-items:center;gap:12px}
+    .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+    .tile{aspect-ratio:1/1;display:flex;flex-direction:column;gap:6px;justify-content:flex-start;text-align:left;padding:12px;border-radius:12px;border:1px solid var(--borderc,#2c2e36);background:var(--darkbg,#1b1c22);color:inherit;cursor:pointer;min-width:0;overflow:hidden;transition:border-color .15s,transform .1s}
+    .tile:hover{border-color:#5b5e6a}
+    .tile:active{transform:scale(.98)}
+    .tile:focus-visible{outline:2px solid var(--a);outline-offset:2px}
+    .tile.on{border-color:var(--a)}
+    .tile.pinned{border-color:#9f7cf2}
+    .tile.off{opacity:.45;filter:grayscale(1);border-style:dashed}
+    .tnames{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 5px;font-size:14px;line-height:1.3}
+    .tnames b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+    .tx{color:var(--textcolor2,#8d909a);font-size:12px}
+    .ttype{font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(139,141,151,.16);align-self:flex-start;white-space:nowrap}
+    .tdir{display:flex;align-items:center;gap:6px;font-size:12px;white-space:nowrap}
+    .tfrom{color:var(--textcolor2,#8d909a);overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+    .tval{font-weight:600}
+    .tval.pos{color:#e8739d}
+    .tval.neg{color:#6b9be8}
+    .tval.zero{color:var(--textcolor2,#8d909a);font-weight:400}
+    .tval.t.pos{color:#5fc28f}
+    .tbadges{margin-top:auto;display:flex;gap:6px;align-items:center;min-height:18px}
+    .sheet-bg{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px}
+    .sheet{width:100%;max-width:480px;max-height:86vh;overflow:auto;background:var(--bgcolor,#121317);border:1px solid var(--borderc,#2c2e36);border-radius:14px;padding:12px}
+    .sheet .card{margin-bottom:0}
+    .sheet-h{margin-bottom:8px}
+    @media (max-width:520px){.sheet-bg{align-items:flex-end;padding:0}.sheet{max-width:none;border-radius:14px 14px 0 0;max-height:88vh}}
     .state-pill{display:inline-block;font-size:11px;font-weight:500;padding:1px 8px;border-radius:999px;margin-left:4px;vertical-align:middle;white-space:nowrap}
     .state-pill.on{background:rgba(63,174,122,.18);color:#86d9ad}
     .state-pill.off{background:rgba(139,141,151,.2);color:#9a9da6}
@@ -3304,6 +3336,44 @@
     </div>`;
   }
 
+  // 타일 순서는 처음 만난 때 순서로 고정한다(값을 고쳐도 자리가 안 바뀌게)
+  const pairKey = (p) => `${p.a}|${p.b}`;
+  function stableOrder(list) {
+    const at = (p) => {
+      const f = p.ab?.first ?? p.ba?.first;
+      return [f?.when?.day ?? 1e9, f?.when?.t ?? '99:99'];
+    };
+    return [...list].sort((x, y) => {
+      const [dx, tx] = at(x), [dy, ty] = at(y);
+      return dx - dy || tx.localeCompare(ty) || pairKey(x).localeCompare(pairKey(y));
+    });
+  }
+
+  function signed(v) { return `${v > 0 ? '+' : ''}${v}`; }
+  const toneOf = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : 'zero');
+
+  /** 정사각형 타일: 이름 · 관계 종류 · 양쪽 호감/신뢰. 누르면 편집 창이 뜬다. */
+  function bondTile(p) {
+    const type = p.ab?.type || p.ba?.type || '';
+    const off = pairOff(p);
+    const pin = !!(p.ab?.pin || p.ba?.pin);
+    const dir = (bd, from) => `<div class="tdir"><span class="tfrom">${escapeHtml(clip(from, 5))}→</span><span class="tval ${toneOf(bd?.aff ?? 0)}" title="호감">♥ ${signed(bd?.aff ?? 0)}</span><span class="tval ${toneOf(bd?.trust ?? 0)} t" title="신뢰">◆ ${signed(bd?.trust ?? 0)}</span></div>`;
+    return `<button class="tile${off ? ' off' : ''}${pin ? ' pinned' : ''}${ui.bondOpen === pairKey(p) ? ' on' : ''}" data-act="bond-open" data-key="${escapeHtml(pairKey(p))}" aria-label="${escapeHtml(p.a)}와 ${escapeHtml(p.b)}의 관계 편집">
+      <div class="tnames"><b>${escapeHtml(p.a)}</b><span class="tx">⇄</span><b>${escapeHtml(p.b)}</b></div>
+      <div class="ttype">${type ? escapeHtml(BOND_LABEL[type]) : '<span class="muted">종류 모름</span>'}</div>
+      ${dir(p.ab, p.a)}${dir(p.ba, p.b)}
+      <div class="tbadges">${pin ? '<span title="값 고정">🔒</span>' : ''}${off ? '<span class="state-pill off">꺼짐</span>' : ''}</div>
+    </button>`;
+  }
+
+  /** 편집 창: 타일 위에 뜬다. 고쳐도 뒤의 타일은 움직이지 않는다. */
+  function bondSheet(p) {
+    return `<div class="sheet-bg" data-act="bond-close"><div class="sheet" role="dialog" aria-modal="true" aria-label="관계 편집">
+      <div class="row sheet-h"><b style="flex:1">관계 편집</b><button class="btn sm" data-act="bond-close-x" aria-label="닫기">✕ 닫기</button></div>
+      ${bondCard(p)}
+    </div></div>`;
+  }
+
   function renderBonds() {
     const on = settings.bonds;
     const list = bondPairs();
@@ -3320,14 +3390,15 @@
         인물 탭에 이름이 등록돼 있어야 해요.</div></div>` : '');
     }
     const focus = ui.relFocus && list.some(p => p.a === ui.relFocus || p.b === ui.relFocus) ? ui.relFocus : null;
-    const shown = (focus ? list.filter(p => p.a === focus || p.b === focus) : list).sort((x, y) => pairOff(x) - pairOff(y)); // 꺼 둔 관계는 아래로
-    const offCount = list.filter(pairOff).length;
+    const shown = stableOrder(focus ? list.filter(p => p.a === focus || p.b === focus) : list);
+    const open = ui.bondOpen ? list.find(p => pairKey(p) === ui.bondOpen) : null;
     return `${head}<div class="${on ? '' : 'off-zone'}"${on ? '' : ' aria-disabled="true"'}>
       ${relMap(list, focus)}
       <div class="row" style="margin:-4px 0 10px">${focus
         ? `<span class="small"><b>${escapeHtml(focus)}</b>의 관계만 보는 중</span><button class="btn sm" data-act="rel-focus" data-name="">전체 보기</button>`
-        : `<span class="small muted">관계도의 이름을 누르면 그 사람 관계만 보여요. −/+로 바로 고칠 수 있어요.${offCount ? ` 꺼 둔 관계 ${offCount}개는 아래에 있어요.` : ''}</span>`}</div>
-      ${shown.map(bondCard).join('')}</div>`;
+        : '<span class="small muted">타일을 누르면 고칠 수 있어요. 관계도의 이름을 누르면 그 사람 관계만 보여요. ♥ 호감 · ◆ 신뢰</span>'}</div>
+      <div class="tiles">${shown.map(bondTile).join('')}</div></div>
+      ${open && on ? bondSheet(open) : ''}`;
   }
 
   /** 접는 칸: 사용자가 펼치거나 접은 상태를 기억해서 화면을 다시 그려도 유지한다 */
@@ -3555,6 +3626,7 @@
     });
     document.body.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && ui.editing) { ui.editing = null; render(); }
+      if (e.key === 'Escape' && ui.bondOpen) { ui.bondOpen = null; render(); }
       if (e.key === 'Enter' && e.target.id === 'dry') document.querySelector('[data-act="dry-run"]')?.click();
       if (e.key === 'Enter' && e.target.id === 'ent-name') document.querySelector('[data-act="ent-add"]')?.click();
     });
@@ -3779,6 +3851,9 @@
       }
       case 'ent-confirm': { const x = state.dict.e[el.dataset.name]; if (x) { x.src = 'manual'; x.n = Math.max(x.n, SPEAKER_ACTIVE_COUNT); retagAll(); await changed('인물로 등록했어요.'); } return; }
       case 'rel-focus': ui.relFocus = el.dataset.name || null; render(); return;
+      case 'bond-open': ui.bondOpen = el.dataset.key; render(); return;
+      case 'bond-close': if (e.target === el) { ui.bondOpen = null; render(); } return; // 바깥 어두운 곳을 눌렀을 때만
+      case 'bond-close-x': ui.bondOpen = null; render(); return;
       case 'bond-adj': {
         const { a, b, f } = el.dataset;
         const bd = bondOf(a, b);
@@ -3799,6 +3874,7 @@
         if (!await confirmDialog(`${a} ⇄ ${b} 관계 기록을 지울까요?`, '지우기')) return;
         delete state.bonds[bondKey(a, b)];
         delete state.bonds[bondKey(b, a)];
+        ui.bondOpen = null;
         await changed('지웠어요.');
         return;
       }
@@ -3954,7 +4030,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
