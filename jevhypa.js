@@ -69,10 +69,10 @@
   };
 
   const MODES = {
-    lean: { label: '하이파식', badge: '추천', desc: '최근 2개만 원문으로 보내고, 그 앞은 전부 기억(이 장면 흐름 + 관계 + 회상)으로 바꿔요. 토큰이 가장 적어요.', rawBudget: 0, minRaw: 2, recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3 },
-    save: { label: '절약', desc: '원문을 적게 남기고 메모도 짧게. 토큰이 가장 적어요.', rawBudget: 3000, minRaw: 4, recallBudget: 700, eventsPerScene: 2, candidates: 16, arcs: 2 },
-    balanced: { label: '균형', desc: '최근 대화를 넉넉히 원문으로 두고 오래된 것만 기억으로.', rawBudget: 6000, minRaw: 6, recallBudget: 1200, eventsPerScene: 4, candidates: 24, arcs: 3 },
-    quality: { label: '품질', desc: '원문을 많이 남기고 메모도 넉넉히. 토큰이 더 들어요.', rawBudget: 12000, minRaw: 10, recallBudget: 2000, eventsPerScene: 6, candidates: 40, arcs: 4 },
+    risu: { label: 'Risu에 맡기기', badge: '추천', desc: '원문은 Risu가 보낸 그대로 두고, Risu가 보내지 않은 이전 대화만 기억(이 장면 흐름 + 관계 + 회상)으로 채워요. 하이파처럼 쓰려면 프롬프트 템플릿의 채팅 범위를 최근 2개 정도로 두세요.', rawBudget: 200000, minRaw: 100, recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3 },
+    save: { label: '절약', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 원문을 적게, 메모도 짧게.', rawBudget: 3000, minRaw: 4, recallBudget: 700, eventsPerScene: 2, candidates: 16, arcs: 2 },
+    balanced: { label: '균형', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 최근 대화를 넉넉히 원문으로.', rawBudget: 6000, minRaw: 6, recallBudget: 1200, eventsPerScene: 4, candidates: 24, arcs: 3 },
+    quality: { label: '품질', desc: 'Risu가 대화를 길게 보낼 때 JevHypa가 직접 잘라요. 원문도 메모도 넉넉히.', rawBudget: 12000, minRaw: 10, recallBudget: 2000, eventsPerScene: 6, candidates: 40, arcs: 4 },
   };
   const MODE_KEYS = ['rawBudget', 'minRaw', 'recallBudget', 'eventsPerScene', 'candidates', 'arcs'];
 
@@ -87,7 +87,7 @@
     // 주소·모델은 비워 두면 고른 프리셋 값으로 채워진다(sanitizeSettings)
     jevPreset: 'openrouter', jevKey: '', jevEndpoint: '', jevModel: '',
     embedPreset: 'openrouter', embedKey: '', embedEndpoint: '', embedModel: '', embedDims: 512,
-    mode: 'lean', ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES.lean[k]])),
+    mode: 'risu', ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES.risu[k]])),
     recallThreshold: 50, saveThreshold: 55,
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
@@ -121,7 +121,8 @@
   const SPEAKER_ACTIVE_COUNT = 2;
   const QUERY_MESSAGES = 6;
   const SECOND_SEARCH = 6;
-  const BRIDGE_MAX_TOKENS = 400;      // "이 장면 흐름" 최대 토큰            // 빠진 근거를 찾을 때 더 볼 메모 수
+  const BRIDGE_MAX_TOKENS = 400;      // "이 장면 흐름" 최대 토큰
+  const UNSENT_MAX_TOKENS = 1500;     // 아직 정리 못 한 이전 메시지 원문 최대 토큰            // 빠진 근거를 찾을 때 더 볼 메모 수
   const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
 
   const KINDS = {
@@ -673,9 +674,9 @@
       embedEndpoint: str(s.embedEndpoint),
       embedModel: str(s.embedModel),
       embedDims: clampNum(s.embedDims, 512, 64, 4096),
-      mode: MODES[s.mode] || s.mode === 'custom' ? s.mode : 'lean',
-      rawBudget: clampNum(s.rawBudget, 0, 0, 200000),
-      minRaw: clampNum(s.minRaw, 2, 2, 100),
+      mode: MODES[s.mode] || s.mode === 'custom' ? s.mode : 'risu',
+      rawBudget: clampNum(s.rawBudget, 200000, 0, 200000),
+      minRaw: clampNum(s.minRaw, 100, 2, 100),
       recallBudget: clampNum(s.recallBudget, 1200, 0, 20000),
       eventsPerScene: clampNum(s.eventsPerScene, 4, 1, 20),
       candidates: clampNum(s.candidates, 24, 4, 200),
@@ -2461,7 +2462,7 @@
     return clip((keep.length ? keep : parts.slice(0, 1)).join(' '), 140);
   }
 
-  function formatMemories(picks, sc, cfg = settings, bridge = []) {
+  function formatMemories(picks, sc, cfg = settings, bridge = [], unsent = []) {
     const arc = arcById(state.open.arc);
     const arcLine = arc && (arc.kw.length || arc.cast.length)
       ? `<current chapter> ${arc.title || `#${state.arcs.indexOf(arc) + 1}`}${whenTag(arc.from) ? ` · from ${whenTag(arc.from)}` : ''}${arc.places.length ? ` · ${arc.places.slice(0, 2).join(', ')}` : ''}${arc.kw.length ? ` · ${arc.kw.slice(0, 6).join(', ')}` : ''}`
@@ -2477,7 +2478,7 @@
     const featured = new Set([...present, ...asked, ...(personaCache && isPerson(canonical(personaCache)) ? [canonical(personaCache)] : [])]);
     const headers = new Map();
     if (cfg.bonds) for (const n of featured) { const h = personHeader(n, featured, present); if (h) headers.set(n, h); }
-    if (!picks.length && !arcLine && !headers.size && !bridge.length) return '';
+    if (!picks.length && !arcLine && !headers.size && !bridge.length && !unsent.length) return '';
     const label = cfg.injectLabel;
     const line = (e, group) => {
       const w = cfg.showStoryTime ? whenTag(e.when) : '';
@@ -2515,7 +2516,8 @@
     const note = cfg.note && cfg.translate !== 'off' ? `${cfg.note} Names may be romanized.` : cfg.note;
     // 원문 바로 앞에 붙는 자리: 이 장면에서 방금 전까지의 흐름
     const flow = bridge.length ? ['<earlier in this scene>', ...bridge.map(e => line(e, ''))].join('\n') : '';
-    return [`[${label}]`, note, arcLine + prevLine, body, flow, `[/${label}]`].filter(Boolean).join('\n');
+    const pending = unsent.length ? ['<not yet summarized>', ...unsent.map(r => `- ${r.role === 'user' ? '(user) ' : ''}${clip(cleanText(stripMeta(r.text)).replace(/\s*\n\s*/g, ' '), 600)}`)].join('\n') : '';
+    return [`[${label}]`, note, arcLine + prevLine, body, flow, pending, `[/${label}]`].filter(Boolean).join('\n');
   }
 
   // 메모 줄만 영어로. 같은 줄은 이번 실행 동안만 기억해 두고 다시 번역하지 않는다(저장하지 않음).
@@ -2637,11 +2639,15 @@
       if (cfg.rejAutoClear && state.turn - (state.rejClearedTurn ?? 0) >= cfg.rejClearEvery) { rejSet = new Set(); state.rejClearedTurn = state.turn; }
       lastEntries = { key: chatKey, entries, raw };
       const { outside } = splitRaw(entries, cfg);
+      // Risu가 보내지 않은 이전 메시지(프롬프트 템플릿의 채팅 범위 밖)
+      const reqKeys = new Set(entries.map(e => e.key));
+      const firstSent = raw.findIndex(r => reqKeys.has(r.key));
+      const notSent = firstSent > 0 ? raw.slice(0, firstSent) : [];
 
       // 잘라내야 하는 메시지가 "다음 처리 순서"의 맨 앞이면 지금 처리한다.
       // 더 오래된 메시지가 밀려 있으면 순서를 지키려고 기다린다(그동안은 원문 그대로 보냄).
       if (!job) {
-        const outsideKeys = new Set(outside.map(e => e.key));
+        const outsideKeys = new Set([...outside, ...notSent].map(e => e.key));
         const now = [];
         for (const t of (raw.length ? ingestTargets(raw) : outside.filter(e => !isSeen(e)))) {
           if (!outsideKeys.has(t.key)) break;
@@ -2675,7 +2681,16 @@
 
       const { picks, trace, sc, bridge } = await recall(entries, visible, cfg);
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
-      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge), cfg);
+      // 아직 정리 못 한(그리고 Risu도 안 보낸) 메시지는 원문을 잠깐 넣어 흐름이 비지 않게
+      const unsent = [];
+      let unsentTokens = 0;
+      for (const r of notSent.filter(x => !isSeen(x)).reverse()) {
+        const t = estimateTokens(r.text);
+        if (unsentTokens + t > UNSENT_MAX_TOKENS && unsent.length) break;
+        unsentTokens += t;
+        unsent.unshift(r);
+      }
+      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge, unsent), cfg);
       const injectedTokens = block ? estimateTokens(block) : 0;
       state.savedTokens = (state.savedTokens ?? 0) + Math.max(0, droppedTokens - injectedTokens);
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
@@ -2747,7 +2762,7 @@
   //  화면
   // ══════════════════════════════════════════════════════════════════════
 
-  const ui = { relFocus: null, openDays: new Set(), daysAll: null, arcsAll: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
+  const ui = { keepOpen: new Map(), relFocus: null, openDays: new Set(), daysAll: null, arcsAll: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
 
   const CSS = `
     :root{--a:#5b7cfa;--ok:#3fae7a;--warn:#e0a03a;--bad:#e0605a}
@@ -3001,7 +3016,7 @@
       <div class="f" style="border:none"><div><label>API 키</label>${p.keyUrl ? `<div class="help"><a href="${p.keyUrl}" target="_blank" rel="noopener">키 받는 곳 ↗</a></div>` : ''}</div>
         <div><input class="inp" type="password" autocomplete="off" data-field="jevKey" placeholder="${escapeHtml(p.keyHint)}" value="${escapeHtml(d.jevKey)}">${keyHint(d)}</div></div>
       <div class="f" style="border:none"><div><label>모델</label><div class="help">모르겠으면 기본 그대로 두세요.</div></div><div>${modelPicker('jevModel', p, d.jevModel)}</div></div>
-      <details${d.jevPreset === 'custom' ? ' open' : ''}><summary>주소 (보통은 안 바꿔도 돼요)</summary>
+      <details${keepOpen('jev-addr', d.jevPreset === 'custom')}><summary>주소 (보통은 안 바꿔도 돼요)</summary>
         <div class="f"><label>주소</label><input class="inp" data-field="jevEndpoint" value="${escapeHtml(d.jevEndpoint)}"></div>
       </details>
       <div class="row"><button class="btn" data-act="test-jev">연결 테스트</button>${testLine('jev')}</div>`;
@@ -3013,7 +3028,7 @@
       ${p.key === 'own' ? `<div class="f" style="border:none"><div><label>임베딩 API 키</label>${p.keyUrl ? `<div class="help"><a href="${p.keyUrl}" target="_blank" rel="noopener">키 받는 곳 ↗</a></div>` : ''}</div><input class="inp" type="password" autocomplete="off" data-field="embedKey" value="${escapeHtml(d.embedKey)}"></div>` : ''}
       ${p.key === 'jev' ? '<div class="help" style="margin:8px 0">Jev에 넣은 OpenRouter 키를 같이 써요.</div>' : ''}
       ${p.format !== 'local' ? `<div class="f" style="border:none"><div><label>모델</label><div class="help">모르겠으면 기본 그대로 두세요.</div></div><div>${modelPicker('embedModel', p, d.embedModel)}</div></div>` : ''}
-      ${p.format !== 'local' ? `<details${d.embedPreset === 'custom' ? ' open' : ''}><summary>주소 · 크기</summary>
+      ${p.format !== 'local' ? `<details${keepOpen('embed-addr', d.embedPreset === 'custom')}><summary>주소 · 크기</summary>
         <div class="f"><label>주소</label><input class="inp" data-field="embedEndpoint" value="${escapeHtml(d.embedEndpoint)}"></div>
         ${p.mrl ? `<div class="f"><div><label>벡터 크기</label><div class="help">작을수록 저장 공간이 줄어요. 512면 충분해요.</div></div><select class="sel" data-field="embedDims">${[256, 512, 768, 1024].map(n => `<option value="${n}"${+d.embedDims === n ? ' selected' : ''}>${n}</option>`).join('')}</select></div>` : ''}
       </details>` : ''}
@@ -3227,7 +3242,7 @@
         const main = people.filter(([n, e]) => (memoCount.get(n) ?? 0) > 0 || e.n >= 2 || ['manual', 'persona', 'intro'].includes(e.src));
         const quiet = people.filter(x => !main.includes(x));
         return (main.map(([n, e]) => row(n, e, false)).join('') || '<div class="card small muted">아직 없어요. 대화가 쌓이면 자동으로 채워져요.</div>') +
-          (quiet.length ? `<details><summary>메모 없이 한 번만 나온 이름 ${quiet.length}개</summary>${quiet.map(([n, e]) => row(n, e, false)).join('')}</details>` : '');
+          (quiet.length ? `<details${keepOpen('quiet', false)}><summary>메모 없이 한 번만 나온 이름 ${quiet.length}개</summary>${quiet.map(([n, e]) => row(n, e, false)).join('')}</details>` : '');
       })()}
       <div class="sec">📍 장소</div><div class="card">${chips('place')}</div>
       <div class="sec">🎒 물건</div><div class="card">${chips('item')}</div>
@@ -3333,7 +3348,7 @@
         </div>
         ${dirRow(p.ab, p.a, p.b)}${dirRow(p.ba, p.b, p.a)}
         <div class="small muted" style="margin-top:6px">${first ? `처음: ${escapeHtml([formatWhen(first.when, true), first.place].filter(Boolean).join(' · ') || '기록 없음')}` : ''}${last ? ` · 최근: ${escapeHtml(formatWhen(last, true))}` : ''}</div>
-        ${hist.length ? `<details style="margin-top:6px"><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
+        ${hist.length ? `<details style="margin-top:6px"${keepOpen(`hist:${p.a}|${p.b}`, false)}><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
       </div>
       <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn sm d" data-act="bond-del" ${da}>관계 지우기</button></div>
     </div>`;
@@ -3363,6 +3378,11 @@
         ? `<span class="small"><b>${escapeHtml(focus)}</b>의 관계만 보는 중</span><button class="btn sm" data-act="rel-focus" data-name="">전체 보기</button>`
         : `<span class="small muted">관계도의 이름을 누르면 그 사람 관계만 보여요. −/+로 바로 고칠 수 있어요.${offCount ? ` 꺼 둔 관계 ${offCount}개는 아래에 있어요.` : ''}</span>`}</div>
       ${shown.map(bondCard).join('')}</div>`;
+  }
+
+  /** 접는 칸: 사용자가 펼치거나 접은 상태를 기억해서 화면을 다시 그려도 유지한다 */
+  function keepOpen(key, def) {
+    return ` data-keep="${escapeHtml(key)}"${(ui.keepOpen.get(key) ?? def) ? ' open' : ''}`;
   }
 
   function renderTrace() {
@@ -3412,7 +3432,7 @@
     return `<div class="sec">Jev 연결</div><div class="card">${jevFields(d)}</div>
       <div class="sec">임베딩</div><div class="card">${embedFields(d)}</div>
       <div class="sec">모드</div><div class="card">${modeFields(d)}
-        <details${d.mode === 'custom' ? ' open' : ''}><summary>숫자로 직접 조절</summary>
+        <details${keepOpen('nums', d.mode === 'custom')}><summary>숫자로 직접 조절</summary>
           ${field('원문 예산 (토큰)', '최근 대화를 이만큼 원문으로 보내요. 그보다 오래된 건 메모로 대체돼요.', num('rawBudget', 0, 200000))}
           ${field('원문 최소 개수', '예산과 상관없이 최근 이만큼은 꼭 원문으로.', num('minRaw', 2, 100))}
           ${field('메모 주입 예산 (토큰)', '0이면 회상을 끕니다.', num('recallBudget', 0, 20000))}
@@ -3577,6 +3597,8 @@
     ui.bound = true;
     document.body.addEventListener('click', (e) => { void onClick(e); });
     document.body.addEventListener('change', (e) => { void onChange(e); });
+    // toggle은 거품이 안 올라와서 잡는 단계(capture)에서 듣는다
+    document.body.addEventListener('toggle', (e) => { const k = e.target?.dataset?.keep; if (k) ui.keepOpen.set(k, e.target.open); }, true);
     document.body.addEventListener('input', (e) => {
       if (e.target.id === 'q') {
         ui.query = e.target.value;
