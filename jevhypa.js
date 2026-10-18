@@ -138,6 +138,7 @@
   const KIND_OPTIONS = {
     trivial: 'filler, scenery, small talk, momentary reaction',
     minor: 'small detail, will not matter later',
+    ask: 'a question or request, not a statement of fact',
     ...Object.fromEntries(KIND_IDS.map(k => [k, KINDS[k].desc])),
   };
   // 카드 칸: 메모가 어떤 종류의 말·사실인지, 지금도 유효한지
@@ -156,7 +157,7 @@
     past: 'a past record, or replaced by newer information',
     future: 'scheduled or planned',
   };
-  const KEEP_IMP = 0.8; // 이만큼 중요한 메모는 장면 상한을 넘어도 상한만큼 더 남긴다
+  const KEEP_IMP = 0.9; // Jev가 이만큼 확실히 중요하다고 본 메모는 장면 상한으로 지우지 않는다(메시지당 후보는 원래 몇 개뿐)
   const RANK_LEVELS = ['unrelated', 'background only', 'useful context', 'answers or explains the latest message']; // 후보마다 붙으니 짧게
   const SEARCH_NEEDS = {
     none: 'nothing important is missing',
@@ -1490,7 +1491,7 @@
     const added = [];
     units.forEach((u, j) => {
       const p = choiceProbs(A[`k${j}`], Object.keys(KIND_OPTIONS));
-      const imp = Math.max(0, Math.min(1, 1 - p.trivial - 0.6 * p.minor));
+      const imp = Math.max(0, Math.min(1, 1 - p.trivial - (p.ask ?? 0) - 0.6 * p.minor)); // 질문·요청은 사실이 아니라 저장하지 않는다
       if (imp < cfg.saveThreshold / 100) return;
       const kind = argmax(Object.fromEntries(KIND_IDS.map(k => [k, p[k]]))) ?? 'event';
       const b = batch[u.bi];
@@ -1680,9 +1681,8 @@
       const cap = sceneCap(sceneById(sid), cfg);
       if (evs.length <= cap) continue;
       evs.sort((a, b) => rankOf(b) - rankOf(a) || b.id - a.id);
-      // 상한을 넘은 것 중 아주 중요한 것은 상한의 2배까지 남긴다(정보가 몰린 장면에서 사실이 잘려 나가지 않게)
-      let spare = cap;
-      for (const e of evs.slice(cap)) { if (e.pin) continue; if (e.imp >= KEEP_IMP && spare > 0) { spare--; continue; } drop.add(e.id); }
+      // 상한은 애매한 메모에만. 확실히 중요한 사실은 정보가 몰린 장면에서도 남긴다.
+      for (const e of evs.slice(cap)) if (!e.pin && e.imp < KEEP_IMP) drop.add(e.id);
     }
     if (drop.size) {
       state.events = state.events.filter(e => !drop.has(e.id));
