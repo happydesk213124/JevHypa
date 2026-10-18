@@ -80,7 +80,7 @@
     // 주소·모델은 비워 두면 고른 프리셋 값으로 채워진다(sanitizeSettings)
     jevPreset: 'openrouter', jevKey: '', jevEndpoint: '', jevModel: '',
     embedPreset: 'openrouter', embedKey: '', embedEndpoint: '', embedModel: '', embedDims: 512,
-    recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3,
+    recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3, sendMemoAll: 50,
     recallThreshold: 50, saveThreshold: 55,
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
@@ -115,7 +115,7 @@
   const SECOND_SEARCH = 6;            // 빠진 근거를 찾을 때 더 볼 메모 수
   const BRIDGE_MAX_TOKENS = 400;      // "이 장면 흐름" 최대 토큰
   const INBOX_MAX = 200;             // 기억해 두는 요청 메시지 최대 개수
-  const SEND_MEMO_MAX = 6;           // 보낼 때 한 번에 만드는 메모 최대 개수 (나머지는 다음에 보낼 때)
+  const SEND_MEMO_MAX = 6;           // 밀린 게 설정 개수보다 많을 때, 보낼 때마다 정리하는 개수
   const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)
 
   const KINDS = {
@@ -676,6 +676,7 @@
       embedDims: clampNum(s.embedDims, 512, 64, 4096),
       recallBudget: clampNum(s.recallBudget, 1400, 0, 20000),
       eventsPerScene: clampNum(s.eventsPerScene, 4, 1, 20),
+      sendMemoAll: clampNum(s.sendMemoAll, 50, 0, 1000),
       candidates: clampNum(s.candidates, 24, 4, 200),
       arcs: clampNum(s.arcs, 3, 1, 10),
       recallThreshold: clampNum(s.recallThreshold, 50, 1, 99),
@@ -3029,6 +3030,8 @@
     return prev.length;
   }
 
+  let backlogWarned = '';   // 밀린 메시지가 많다는 알림을 띄운 채팅 (채팅마다 한 번)
+
   async function beforeRequestHandler(messages, type) {
     if ((type !== 'model' && type !== 'main') || busy) return messages;
     busy = true;
@@ -3048,12 +3051,18 @@
       const dropped = state.inbox.slice(0, overlapStart(state.inbox, entries)).filter(x => !isSeen(x));
       state.inbox = [...dropped, ...entries.filter(e => !isSeen(e)).map(e => ({ key: e.key, hash: e.hash, loose: e.loose, role: e.role, text: e.text }))]; // 고친 메시지는 고친 글로
       if (state.inbox.length > INBOX_MAX) state.inbox = state.inbox.slice(-INBOX_MAX);
-      // 채팅을 열 때 찾아 둔 밀린 메시지(요청에 한 번도 안 실린 것)가 먼저, 그다음 방금 빠진 것. 오래된 순으로 최대 6개.
+      // 채팅을 열 때 찾아 둔 밀린 메시지(요청에 한 번도 안 실린 것)가 먼저, 그다음 방금 빠진 것. 오래된 순.
+      // 설정한 개수(기본 50) 이하면 지금 전부, 넘으면 6개씩만 하고 채팅마다 한 번 "지금 전부 처리"를 권한다.
       const older = backlogList().filter(e => !seenAny(e) && !isIn(e));
       const olderKeys = new Set(older.flatMap(e => [e.key, e.loose]));
       const todo = [...older, ...dropped.filter(x => !olderKeys.has(x.key) && !olderKeys.has(x.loose))];
       if (todo.length && !job) {
-        const batch = todo.slice(0, SEND_MEMO_MAX);
+        const all = todo.length <= cfg.sendMemoAll;
+        const batch = all ? todo : todo.slice(0, SEND_MEMO_MAX);
+        if (!all && backlogWarned !== chatKey) {
+          backlogWarned = chatKey;
+          void Promise.resolve().then(() => R.alert?.(`JevHypa: 아직 메모로 안 만든 메시지가 ${todo.length}개예요.\n보낼 때 한꺼번에 하면 답장이 오래 늦어져서, 보낼 때마다 ${SEND_MEMO_MAX}개씩만 정리할게요.\n🧠 JevHypa › 🧰 도구 › "지금 전부 처리"로 한 번에 정리하는 걸 추천해요.`)).catch(() => {});
+        }
         let done = 0;
         try { await timed(tr, '메모 만들기', async () => { done = await ingest(batch, cfg, Infinity); }, () => `${done}/${batch.length}개${todo.length > batch.length ? ` · 남은 ${todo.length - batch.length}개는 다음에` : ''}`); } catch (error) { setError('메모 만들기', error); }
         state.inbox = state.inbox.filter(x => !isSeen(x));
@@ -3527,7 +3536,7 @@
     return `${statusBanner()}
       <div class="grid">${kpi(active.length, '사건 메모')}${kpi(state.scenes.length, '장면')}${kpi(state.arcs.length, '대단원')}${kpi(fmtTokens(last?.injectedTokens ?? 0), '마지막 주입 토큰')}</div>
       ${state.gap ? `<div class="banner bad"><div class="g"><b>앞부분 ${state.gap}개가 정리 안 됐어요</b><div class="small muted">뒷부분이 먼저 정리돼서 이야기 순서가 꼬였어요. 처음부터 다시 정리하면 순서대로 맞춰져요. (사전은 남아요)</div></div><button class="btn p" data-act="process-all" data-rebuild="1"${processing ? ' disabled' : ''}>처음부터 다시 정리</button></div>` : ''}
-      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 메모로 안 만든 메시지 ${state.pending}개</b><div class="small muted">Risu 요청에서 빠질 때 보낼 때마다 오래된 것부터 ${SEND_MEMO_MAX}개씩 메모가 돼요. 한 번에 끝내려면 '지금 전부 처리'를 누르세요.</div></div><button class="btn" data-act="process-all"${processing ? ' disabled' : ''}>지금 전부 처리</button></div>` : ''}
+      ${!state.gap && state.pending ? `<div class="banner warn"><div class="g"><b>아직 메모로 안 만든 메시지 ${state.pending}개</b><div class="small muted">${state.pending <= settings.sendMemoAll ? '다음에 보낼 때 전부 메모가 돼요.' : `많아서 보낼 때마다 ${SEND_MEMO_MAX}개씩 메모가 돼요.`} 지금 바로 하려면 '지금 전부 처리'를 누르세요.</div></div><button class="btn" data-act="process-all"${processing ? ' disabled' : ''}>지금 전부 처리</button></div>` : ''}
       ${ui.progress ? `<div class="card small">${escapeHtml(ui.progress)}</div>` : ''}
       <div class="sec">지금</div>
       <div class="card">
@@ -3951,6 +3960,7 @@
       <div class="sec">기억 주입</div><div class="card">
         <div class="help" style="margin-bottom:8px">Risu가 보낸 대화는 그대로 두고, 그보다 옛날 대화만 메모로 넣어요.</div>
           ${field('메모 주입 예산 (토큰)', '메모를 최대 이만큼 넣어요. 크면 많이 기억, 작으면 토큰 절약. 0이면 옛날 메모는 안 넣어요.', num('recallBudget', 0, 20000))}
+          ${field('보낼 때 한 번에 정리', '밀린 메시지가 이 개수 이하면 보낼 때 전부 정리해요(그만큼 답장이 늦게 시작돼요). 넘으면 보낼 때마다 6개씩만 하고 "지금 전부 처리"를 권해요. 0이면 늘 6개씩.', num('sendMemoAll', 0, 1000))}
           ${field('장면당 메모 수', '한 장면에서 남길 메모 개수. 적으면 꼭 필요한 것만 남아요.', num('eventsPerScene', 1, 20))}
           ${field('Jev 후보 수', '매번 Jev가 검토할 메모 수. 많으면 덜 놓치지만 Jev 비용이 늘어요.', num('candidates', 4, 200))}
           ${field('대단원 후보 수', '지금 대화와 가까운 챕터를 몇 개 우선할지.', num('arcs', 1, 10))}
