@@ -2018,6 +2018,7 @@
         const targets = terms.length ? terms : others.length === 1 ? [{ to: others[0], term: null }] : [];
         for (const { to, term } of targets) {
           const bond = bondOf(a, to);
+          if (bond.off) continue; // 꺼 둔 관계는 쌓지 않는다
           if (term && bond.term !== term) { if (bond.term) bondHistory(bond, `호칭 "${bond.term}" → "${term}"`); bond.term = term; }
           if (level && bond.polite !== level) { if (bond.polite) bondHistory(bond, level === 'polite' ? '반말 → 존댓말' : '존댓말 → 반말'); bond.polite = level; }
           bond.first ??= { when: b.when ?? nowWhen(), place: b.place ?? null };
@@ -2056,7 +2057,9 @@
         score.set(k, (score.get(k) ?? 0) + (e.kind === 'relation' ? 3 : 1) + e.imp);
       }
     }
-    return [...score.entries()].sort((x, y) => y[1] - x[1]).slice(0, MAX_PAIRS_PER_BATCH).map(([k]) => k.split('|'));
+    const off = ([x, y]) => state.bonds?.[bondKey(x, y)]?.off || state.bonds?.[bondKey(y, x)]?.off;
+    return [...score.entries()].map(([k, v]) => [k.split('|'), v]).filter(([p]) => !off(p)) // 꺼 둔 관계는 Jev에게 묻지도 않는다
+      .sort((x, y) => y[1] - x[1]).slice(0, MAX_PAIRS_PER_BATCH).map(([p]) => p);
   }
 
   // 진행 중인 약속·계획: 계획 형식이거나, 약속 종류인데 "한 일"이 아닌 것. 과거·닫힘·지난 기억은 뺀다.
@@ -2165,7 +2168,7 @@
         parts.push(`away (last seen ${seen || 'earlier'}${mood})`);
       }
     }
-    const bonds = Object.values(state.bonds ?? {}).filter(bd => bd.a === name && featured.has(bd.b) && bd.b !== name);
+    const bonds = Object.values(state.bonds ?? {}).filter(bd => bd.a === name && !bd.off && featured.has(bd.b) && bd.b !== name);
     const ranked = bonds.map(bd => ({ bd, w: (bd.type ? 2 : 0) + Math.abs(bd.aff) + Math.abs(bd.trust) + (bd.term ? 1 : 0) }))
       .filter(x => x.w > 0).sort((a, b) => b.w - a.w).slice(0, 3);
     for (const { bd } of ranked) { const s = bondPhrase(bd); if (s) parts.push(s); }
@@ -2752,6 +2755,18 @@
     .bond .axes{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px}
     .bond .ax{display:inline-flex;align-items:center;gap:4px}
     .bond.pinned{border-color:#9f7cf2}
+    .toggle-card{display:flex;align-items:center;gap:12px}
+    .state-pill{display:inline-block;font-size:11px;font-weight:500;padding:1px 8px;border-radius:999px;margin-left:4px;vertical-align:middle;white-space:nowrap}
+    .state-pill.on{background:rgba(63,174,122,.18);color:#86d9ad}
+    .state-pill.off{background:rgba(139,141,151,.2);color:#9a9da6}
+    .off-zone{opacity:.42;filter:grayscale(1);pointer-events:none;user-select:none;transition:opacity .2s,filter .2s}
+    .bond.is-off{border-style:dashed;background:transparent}
+    .bond.is-off .bond-body{opacity:.42;filter:grayscale(1);pointer-events:none;user-select:none}
+    .bond.is-off b{color:var(--textcolor2,#9a9da6)}
+    .sw.sm{width:36px;height:20px;flex:0 0 auto}
+    .sw.sm span:before{width:14px;height:14px}
+    .sw.sm input:checked+span:before{transform:translateX(16px)}
+    .sw input:focus-visible+span{outline:2px solid var(--a);outline-offset:2px}
     .btn.ic{min-width:34px;min-height:34px;padding:2px 8px}
     .gauge{position:relative;display:inline-block;width:76px;height:8px;border-radius:4px;background:rgba(139,141,151,.2);overflow:hidden}
     .gauge::after{content:'';position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.35)}
@@ -3178,9 +3193,10 @@
       const [x1, y1] = pos.get(p.a), [x2, y2] = pos.get(p.b);
       const affs = [p.ab?.aff, p.ba?.aff].filter(v => v != null);
       const aff = affs.length ? affs.reduce((s, v) => s + v, 0) / affs.length : 0;
-      const color = aff > 0.4 ? '#e8739d' : aff < -0.4 ? '#6b9be8' : '#8d909a';
-      const dim = focus && p.a !== focus && p.b !== focus ? ' opacity="0.15"' : '';
-      const type = p.ab?.type || p.ba?.type;
+      const off = pairOff(p);
+      const color = off ? '#5b5d66' : aff > 0.4 ? '#e8739d' : aff < -0.4 ? '#6b9be8' : '#8d909a';
+      const dim = focus && p.a !== focus && p.b !== focus ? ' opacity="0.15"' : off ? ' opacity="0.45"' : '';
+      const type = off ? null : p.ab?.type || p.ba?.type;
       const label = type ? `<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 3}" class="elab"${dim}>${escapeHtml(BOND_LABEL[type])}</text>` : '';
       return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${(1.5 + Math.abs(aff) * 0.8).toFixed(1)}"${type ? '' : ' stroke-dasharray="4 3"'} stroke-linecap="round"${dim}/>${label}`;
     }).join('');
@@ -3212,44 +3228,64 @@
     </div>`;
   }
 
+  const pairOff = (p) => !!(p.ab?.off || p.ba?.off);
+
   function bondCard(p) {
     const type = p.ab?.type || p.ba?.type || '';
     const pin = !!(p.ab?.pin || p.ba?.pin);
+    const off = pairOff(p);
     const first = p.ab?.first ?? p.ba?.first;
     const last = [p.ab?.last, p.ba?.last].filter(Boolean).sort((x, y) => (y.day ?? 0) - (x.day ?? 0))[0];
     const hist = [...(p.ab?.hist ?? []).map(h => ({ ...h, d: `${p.a}→${p.b}` })), ...(p.ba?.hist ?? []).map(h => ({ ...h, d: `${p.b}→${p.a}` }))]
       .sort((x, y) => (x.when?.day ?? 0) - (y.when?.day ?? 0));
     const da = `data-a="${escapeHtml(p.a)}" data-b="${escapeHtml(p.b)}"`;
-    return `<div class="card bond${pin ? ' pinned' : ''}">
+    return `<div class="card bond${pin ? ' pinned' : ''}${off ? ' is-off' : ''}">
       <div class="row" style="flex-wrap:nowrap">
         <b style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0">${escapeHtml(p.a)} ⇄ ${escapeHtml(p.b)}</b>
-        <select class="sel sm" style="width:auto;flex:0 0 auto;max-width:150px" data-act="bond-type" ${da} aria-label="관계 종류">
-          <option value=""${type ? '' : ' selected'}>관계 모름</option>
-          ${Object.entries(BOND_LABEL).map(([k, v]) => `<option value="${k}"${type === k ? ' selected' : ''}>${v}</option>`).join('')}
-        </select>
-        <button class="btn sm ic${pin ? ' p' : ''}" data-act="bond-pin" ${da} title="${pin ? '자동 변경 잠금 풀기' : '자동으로 바뀌지 않게 잠그기'}" aria-label="잠금">${pin ? '🔒' : '🔓'}</button>
+        ${off ? '<span class="state-pill off">꺼짐</span>' : ''}
+        <label class="sw sm" title="${off ? '이 관계 다시 쓰기' : '이 관계 끄기: 메모에 안 넣고 자동으로 갱신하지 않아요'}"><input type="checkbox" data-act="bond-onoff" ${da}${off ? '' : ' checked'} aria-label="${escapeHtml(p.a)}와 ${escapeHtml(p.b)}의 관계 사용"><span></span></label>
       </div>
-      ${dirRow(p.ab, p.a, p.b)}${dirRow(p.ba, p.b, p.a)}
-      <div class="small muted" style="margin-top:6px">${first ? `처음: ${escapeHtml([formatWhen(first.when, true), first.place].filter(Boolean).join(' · ') || '기록 없음')}` : ''}${last ? ` · 최근: ${escapeHtml(formatWhen(last, true))}` : ''}</div>
-      ${hist.length ? `<details style="margin-top:6px"><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
+      ${off ? '<div class="small muted" style="margin-top:4px">꺼 둔 관계예요. 기록은 남아 있지만 메모에 넣지 않고, 새 대화로 바뀌지도 않아요.</div>' : ''}
+      <div class="bond-body"${off ? ' aria-disabled="true"' : ''}>
+        <div class="row" style="flex-wrap:nowrap;margin-top:8px">
+          <select class="sel sm" style="width:auto;flex:1;min-width:0;max-width:200px" data-act="bond-type" ${da} aria-label="관계 종류"${off ? ' disabled' : ''}>
+            <option value=""${type ? '' : ' selected'}>관계 종류 모름</option>
+            ${Object.entries(BOND_LABEL).map(([k, v]) => `<option value="${k}"${type === k ? ' selected' : ''}>${v}</option>`).join('')}
+          </select>
+          <button class="btn sm${pin ? ' p' : ''}" data-act="bond-pin" ${da} title="${pin ? '자동 변경 잠금 풀기' : '지금 값을 고정: 대화가 이어져도 자동으로 바뀌지 않아요'}"${off ? ' disabled' : ''}>${pin ? '🔒 값 고정됨' : '🔓 값 고정'}</button>
+        </div>
+        ${dirRow(p.ab, p.a, p.b)}${dirRow(p.ba, p.b, p.a)}
+        <div class="small muted" style="margin-top:6px">${first ? `처음: ${escapeHtml([formatWhen(first.when, true), first.place].filter(Boolean).join(' · ') || '기록 없음')}` : ''}${last ? ` · 최근: ${escapeHtml(formatWhen(last, true))}` : ''}</div>
+        ${hist.length ? `<details style="margin-top:6px"><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
+      </div>
       <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn sm d" data-act="bond-del" ${da}>관계 지우기</button></div>
     </div>`;
   }
 
   function renderBonds() {
+    const on = settings.bonds;
     const list = bondPairs();
+    const head = `<div class="card toggle-card${on ? '' : ' is-off'}">
+      <div style="flex:1;min-width:0"><b>관계 추적</b> <span class="state-pill ${on ? 'on' : 'off'}">${on ? '켜짐' : '꺼짐'}</span>
+        <div class="small muted" style="margin-top:4px">${on
+          ? '대화가 정리될 때 호칭·말투·호감·신뢰·관계 종류를 쌓고, 지금 장면 사람끼리의 관계를 메모에 한 줄로 넣어요.'
+          : '꺼져 있어요. 지금까지의 기록은 그대로 남아 있지만, 새로 쌓지 않고 메모에도 넣지 않아요. Jev 문항도 그만큼 줄어요.'}</div></div>
+      <label class="sw" title="관계 추적 켜기/끄기"><input type="checkbox" data-act="bonds-toggle"${on ? ' checked' : ''} aria-label="관계 추적"><span></span></label>
+    </div>`;
     if (!list.length) {
-      return `<div class="card empty"><b>아직 관계 기록이 없어요</b>
+      return head + (on ? `<div class="card empty"><b>아직 관계 기록이 없어요</b>
         <div class="small muted" style="margin-top:6px">대화가 정리될 때 누가 누구를 어떻게 부르는지(호칭·존댓말), 사이가 가까워졌는지 멀어졌는지를 자동으로 쌓아요.
-        인물 탭에 이름이 등록돼 있어야 해요. 설정의 <b>관계 추적</b>이 켜져 있는지도 확인하세요.</div></div>`;
+        인물 탭에 이름이 등록돼 있어야 해요.</div></div>` : '');
     }
     const focus = ui.relFocus && list.some(p => p.a === ui.relFocus || p.b === ui.relFocus) ? ui.relFocus : null;
-    const shown = focus ? list.filter(p => p.a === focus || p.b === focus) : list;
-    return `${relMap(list, focus)}
+    const shown = (focus ? list.filter(p => p.a === focus || p.b === focus) : list).sort((x, y) => pairOff(x) - pairOff(y)); // 꺼 둔 관계는 아래로
+    const offCount = list.filter(pairOff).length;
+    return `${head}<div class="${on ? '' : 'off-zone'}"${on ? '' : ' aria-disabled="true"'}>
+      ${relMap(list, focus)}
       <div class="row" style="margin:-4px 0 10px">${focus
         ? `<span class="small"><b>${escapeHtml(focus)}</b>의 관계만 보는 중</span><button class="btn sm" data-act="rel-focus" data-name="">전체 보기</button>`
-        : '<span class="small muted">관계도의 이름을 누르면 그 사람 관계만 보여요. −/+로 바로 고칠 수 있어요.</span>'}</div>
-      ${shown.map(bondCard).join('')}`;
+        : `<span class="small muted">관계도의 이름을 누르면 그 사람 관계만 보여요. −/+로 바로 고칠 수 있어요.${offCount ? ` 꺼 둔 관계 ${offCount}개는 아래에 있어요.` : ''}</span>`}</div>
+      ${shown.map(bondCard).join('')}</div>`;
   }
 
   function renderTrace() {
@@ -3486,6 +3522,23 @@
     }
     if (el.dataset?.field === 'translate') document.querySelectorAll('[data-tr]').forEach(r => { r.style.display = r.dataset.tr.split(' ').includes(el.value) ? '' : 'none'; });
     if (el.dataset?.field && ui.tab === 'settings' && !ui.wiz) { scheduleSettingsSave(); return; }
+    if (act === 'bonds-toggle') {
+      await saveSettings({ ...settings, bonds: el.checked });
+      ui.draft = null;
+      recallCache.clear();
+      render();
+      toast(el.checked ? '관계 추적을 켰어요.' : '관계 추적을 껐어요. 기록은 남아 있어요.');
+      return;
+    }
+    if (act === 'bond-onoff') {
+      const { a, b } = el.dataset;
+      for (const [x, y] of [[a, b], [b, a]]) bondOf(x, y).off = !el.checked;
+      recallCache.clear();
+      await persist();
+      render();
+      toast(el.checked ? `${a} ⇄ ${b} 관계를 다시 써요.` : `${a} ⇄ ${b} 관계를 껐어요. 메모에 넣지 않아요.`);
+      return;
+    }
     if (act === 'bond-type') {
       const { a, b } = el.dataset;
       const to = el.value || null;
