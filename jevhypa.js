@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.4.0
+//@version 1.4.1
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -2998,6 +2998,37 @@
 
   const ready = (cfg = settings) => cfg.enabled && !!cfg.jevKey;
 
+  /**
+   * 지난 요청 목록(prev)의 뒷부분이 이번 요청(cur)의 앞부분과 겹치는 곳을 찾아, 겹침이 시작하는 prev 번호를 돌려준다.
+   * 그보다 앞은 요청에서 빠진 메시지다. 글 내용으로만 맞추므로 "응." 같은 같은 글이 여러 개여도 순서째로 맞춘다.
+   *  · 꼭 맞으면 그곳 (같은 요청을 다시 보내는 리롤도 여기)
+   *  · 아니면 고치거나 지운 메시지가 섞인 곳: 지난 목록이 이번 요청 안에 순서대로 절반 넘게(2개 이상) 그대로 있으면.
+   *    보낼 때마다 맨 끝은 새 메시지라 그건 맞춰 보지 않는다
+   *  · 겹침이 없으면 지난 목록 전부가 빠진 것
+   */
+  function overlapStart(prev, cur) {
+    const same = (p, c) => p.key === c.key || (!!p.loose && p.loose === c.loose);
+    for (let i = 0; i < prev.length; i++) {
+      const L = prev.length - i;
+      if (L > cur.length) continue;
+      let ok = true;
+      for (let k = 0; k < L && ok; k++) ok = same(prev[i + k], cur[k]);
+      if (ok) return i;
+    }
+    const head = cur.slice(0, -1);
+    for (let i = 0; i < prev.length; i++) {
+      const L = prev.length - i;
+      if (L < 2) break;
+      let j = 0, hit = 0;
+      for (let k = i; k < prev.length; k++) {
+        const at = head.findIndex((c, x) => x >= j && same(prev[k], c));
+        if (at >= 0) { hit++; j = at + 1; }
+      }
+      if (hit >= Math.max(2, Math.ceil(L / 2))) return i;
+    }
+    return prev.length;
+  }
+
   async function beforeRequestHandler(messages, type) {
     if ((type !== 'model' && type !== 'main') || busy) return messages;
     busy = true;
@@ -3012,9 +3043,9 @@
       state.inbox ??= [];
       const inReq = new Set(entries.flatMap(e => [e.key, e.loose]));
       const isIn = (x) => inReq.has(x.key) || inReq.has(x.loose);
-      // 빠진 것: 이번 요청에 있는 메시지보다 앞(오래된 쪽)에 있던 것만. 그 사이나 뒤에서 사라진 건 지운 메시지라 버린다.
-      const firstIn = state.inbox.findIndex(isIn);
-      const dropped = state.inbox.filter((x, i) => (firstIn < 0 || i < firstIn) && !isIn(x) && !isSeen(x));
+      // 빠진 것: 지난 요청 목록과 이번 요청을 순서대로 맞춰 보고, 겹치는 부분보다 앞(오래된 쪽)에 있던 것만.
+      // 겹치는 부분에서 글이 바뀐 건 고친 메시지라 옛 글은 버린다.
+      const dropped = state.inbox.slice(0, overlapStart(state.inbox, entries)).filter(x => !isSeen(x));
       state.inbox = [...dropped, ...entries.filter(e => !isSeen(e)).map(e => ({ key: e.key, hash: e.hash, loose: e.loose, role: e.role, text: e.text }))]; // 고친 메시지는 고친 글로
       if (state.inbox.length > INBOX_MAX) state.inbox = state.inbox.slice(-INBOX_MAX);
       // 채팅을 열 때 찾아 둔 밀린 메시지(요청에 한 번도 안 실린 것)가 먼저, 그다음 방금 빠진 것. 오래된 순으로 최대 6개.
@@ -4536,7 +4567,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, flushSave, persist, backupToLore, readLoreBackup, restoreFromLore, saveStats, splitState, setLocalStore: (v) => { localStore = v; }, packJson, saveChainNow: () => saveChain, renderDebug, debugLog: () => debugLog, trackSpeech, speechLevel, addressTerms, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, overlapStart, rankProb, packSentences, stableOrder, bondTile, intimacyOf, flushSave, persist, backupToLore, readLoreBackup, restoreFromLore, saveStats, splitState, setLocalStore: (v) => { localStore = v; }, packJson, saveChainNow: () => saveChain, renderDebug, debugLog: () => debugLog, trackSpeech, speechLevel, addressTerms, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
