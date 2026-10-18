@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.3.1
+//@version 1.4.0
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -1019,7 +1019,8 @@
   let personaCache = '';
 
   function migrateState(loaded) {
-    const s = { ...emptyState(), ...loaded };
+    const { fmt, chunks, ...plain } = loaded;
+    const s = { ...emptyState(), ...plain };
     s.dict = { e: { ...(loaded.dict?.e ?? {}) }, rej: [...(loaded.dict?.rej ?? [])], sug: [...(loaded.dict?.sug ?? [])], nosug: [...(loaded.dict?.nosug ?? [])] };
     s.clock = { ...emptyState().clock, ...(loaded.clock ?? {}) };
     s.open = { ...emptyState().open, ...(loaded.open ?? {}) };
@@ -1067,11 +1068,29 @@
     chatLabel = { char: id.char, chat: id.chat };
     if (!id.cached) rawChatObj = id.chatObj;
     if (id.key === chatKey) return true;
+    if (chatKey) void flushSave({ sync: true }); // 지난 채팅의 예약된 저장 · 동기화 사본을 먼저 쓴다 (지금 상태로 바로 떠 둔다)
     chatKey = id.key;
-    let loaded = null;
-    try { loaded = await R.pluginStorage.getItem(STORE + id.key); } catch (e) { setError('불러오기', e); }
-    if (typeof loaded === 'string') { try { loaded = JSON.parse(loaded); } catch { loaded = null; } }
-    state = loaded && Array.isArray(loaded.events) ? migrateState(loaded) : emptyState();
+    loadingChat = true;
+    let saved = null, restored = false;
+    try {
+      await saveChain.catch(() => {}); // 아직 쓰는 중인 저장이 끝난 뒤에 읽는다 (금방 돌아온 채팅이 옛것으로 읽히지 않게)
+      try { saved = await readSave(id.key); } catch (e) { setError('불러오기', e); }
+      written = saved?.seed ?? new Map();
+      savedChunks = new Set(saved?.chunks ?? []);
+      sync.dirty = false;
+      sync.at = Date.now();
+      sync.last = null;
+      if (!saved) {
+        const data = await readLoreBackup(id.chatObj);
+        if (data) { saved = { data }; restored = true; console.log(LOG, '채팅 로어북 백업에서 기억을 되살렸어요 · 메모', data.events.length, '개'); }
+      }
+      state = saved?.data && Array.isArray(saved.data.events) ? migrateState(saved.data) : emptyState();
+    } finally { loadingChat = false; }
+    // 예전 형식 · 백업에서 되살린 것은 새 형식으로 바로 다시 쓴다. 다른 기기가 더 최근이면 이 기기 작업본을 맞춘다.
+    if (saved?.legacy || restored) { sync.dirty = true; sync.at = 0; }
+    if (saved?.legacy || restored || saved?.source === 'synced') void persist();
+    if (restored) ui.restored = { key: id.key, n: state.events.length };
+    queueReembed();
     seenSet = new Set(state.seen);
     rejSet = new Set(state.dict.rej);
     gramCache = new Map();
@@ -1112,15 +1131,297 @@
       .finally(() => { endTrace(tr, 'bg'); job = null; ui.progress = ''; if (chatKey === key) refreshPending(); void persist(); show(); });
   }
 
+  // ── 저장 ──
+  // Risu 플러그인 저장소(세이브 파일 · 구글 드라이브 백업 · 동기화에 들어감)는 쓸 때마다 무겁다:
+  // 작은 값들은 모두 한 덩어리로 묶여 저장할 때마다 통째로 다시 써진다. 그래서 둘로 나눈다.
+  //  · 작업본: 이 기기 저장소(IndexedDB). 핵심 하나 + 메모 묶음(번호 150칸마다 하나, 벡터 포함).
+  //    1초 몰아서, 바뀐 묶음만 쓴다. 키마다 따로 써져서 가볍다.
+  //  · 동기화 사본: 플러그인 저장소에 채팅마다 압축한 값 하나(벡터 없음). 바뀌었을 때만 3분에 한 번,
+  //    그리고 채팅을 바꿀 때 · 끌 때 쓴다. 다른 기기에서는 이걸 읽고 벡터만 다시 계산한다.
+  // 채팅을 열면 둘 중 더 최근 것을 쓴다.
+  const CHUNK = 150;
+  const SAVE_DELAY = 1000;
+  const SYNC_EVERY = 3 * 60 * 1000;
+  const LOCAL = 'jevhypa_';
+  let localStore = null;        // 기기 저장소. 없는 Risu면 동기화 사본만 (저장할 때마다) 쓴다.
+  let written = new Map();      // 기기 저장 키 → 마지막으로 쓴 내용. 같으면 다시 안 쓴다.
+  let savedChunks = new Set();  // 기기에 저장돼 있는 메모 묶음 번호
+  let saveTimer = null;
+  let loadingChat = false;      // 채팅을 바꾸는 중에는 저장하지 않는다 (다른 채팅 기억이 섞이지 않게)
   let saveChain = Promise.resolve();
+  let reembedRunning = false;
+  const sync = { dirty: false, at: 0, timer: null, last: null };
+  const localCore = (key) => `${LOCAL}${key}~core`;
+  const localChunk = (key, n) => `${LOCAL}${key}~${n}`;
+  const saveStats = { writes: 0, bytes: 0, lastBytes: 0, lastKeys: 0, lastMs: 0, lastAt: 0, totalKB: 0, syncKB: 0, syncAt: 0 };
+
+  async function initLocalStore() {
+    try { localStore = R.getLocalPluginStorage ? await R.getLocalPluginStorage() : null; } catch { localStore = null; }
+  }
+
+  /** 상태를 핵심과 메모 묶음으로 나눈다. */
+  function splitState(s) {
+    const chunks = new Map();
+    for (const e of s.events) {
+      const n = Math.floor((Number(e.id) || 0) / CHUNK);
+      if (!chunks.has(n)) chunks.set(n, []);
+      chunks.get(n).push(e);
+    }
+    const { events, ...core } = s;
+    return { core: { ...core, chunks: [...chunks.keys()] }, chunks };
+  }
+
+  /** 저장을 예약한다. 1초 안에 들어온 변경은 한 번에 쓴다. */
   function persist() {
+    if (chatKey && !saveTimer) saveTimer = setTimeout(() => { saveTimer = null; void flushSave(); }, SAVE_DELAY);
+    return Promise.resolve();
+  }
+
+  /** 예약된 저장을 지금 쓴다(바뀐 조각만). sync: 동기화 사본도 지금 쓴다. */
+  function flushSave({ sync: forceSync = false } = {}) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
     const key = chatKey;
-    if (!key) return Promise.resolve();
+    if (!key || loadingChat) return saveChain;
     state.seen = [...seenSet].slice(-MAX_SEEN);
     state.dict.rej = [...rejSet].slice(-4000);
-    const snapshot = JSON.parse(JSON.stringify(state));
-    saveChain = saveChain.catch(() => {}).then(() => R.pluginStorage.setItem(STORE + key, snapshot));
+    if (!localStore) {
+      // 기기 저장소가 없는 Risu: 동기화 사본이 유일한 저장
+      const json = JSON.stringify(backupData());
+      if (written.get(STORE + key) !== json) { written.set(STORE + key, json); state.savedAt = Date.now(); writeSync(key, json); }
+      return saveChain;
+    }
+    const { core, chunks } = splitState(state);
+    const writes = [];
+    for (const [n, list] of chunks) {
+      const k = localChunk(key, n), json = JSON.stringify(list);
+      if (written.get(k) !== json) { written.set(k, json); writes.push({ k, json }); }
+    }
+    const removed = [...savedChunks].filter(n => !chunks.has(n));
+    savedChunks = new Set(chunks.keys());
+    for (const n of removed) written.delete(localChunk(key, n));
+    const { savedAt, ...coreBody } = core;
+    const bodyJson = JSON.stringify(coreBody);
+    const changed = writes.length > 0 || removed.length > 0 || written.get(localCore(key)) !== bodyJson;
+    if (changed) {
+      written.set(localCore(key), bodyJson);
+      state.savedAt = Date.now();
+      sync.dirty = true;
+      const coreJson = JSON.stringify({ ...coreBody, savedAt: state.savedAt });
+      saveStats.lastBytes = coreJson.length + writes.reduce((a, w) => a + w.json.length, 0);
+      saveStats.lastKeys = writes.length + 1;
+      saveStats.bytes += saveStats.lastBytes;
+      saveStats.writes++;
+      saveStats.totalKB = Math.round([...written.entries()].filter(([k]) => k.startsWith(`${LOCAL}${key}~`)).reduce((a, [, v]) => a + v.length, 0) / 1024);
+      saveChain = saveChain.catch(() => {}).then(async () => {
+        const t0 = nowMs();
+        // 묶음을 먼저 쓰고, 다 써진 뒤에 핵심(묶음 목록)을 쓴다. 묶음이 실패하면 핵심은 옛것으로 둔다.
+        let failed = null;
+        await Promise.all(writes.map(w => Promise.resolve().then(() => localStore.setItem(w.k, JSON.parse(w.json))).catch(error => {
+          if (written.get(w.k) === w.json) written.delete(w.k);
+          failed = error;
+        })));
+        if (failed) { written.delete(localCore(key)); throw failed; }
+        try { await localStore.setItem(localCore(key), JSON.parse(coreJson)); } catch (error) { if (written.get(localCore(key)) === bodyJson) written.delete(localCore(key)); throw error; }
+        for (const n of removed) await Promise.resolve().then(() => localStore.removeItem?.(localChunk(key, n))).catch(() => {});
+        saveStats.lastMs = Math.round(nowMs() - t0);
+        saveStats.lastAt = Date.now();
+      }).catch(error => { setError('저장', error); });
+    }
+    if (sync.dirty && (forceSync || Date.now() - sync.at >= SYNC_EVERY)) {
+      sync.dirty = false;
+      writeSync(key, JSON.stringify(backupData()));
+    } else if (sync.dirty && !sync.timer) {
+      // 3분이 안 됐으면 그때 다시 본다 (그 사이 더 바뀌면 한 번에)
+      sync.timer = setTimeout(() => { sync.timer = null; if (chatKey === key) void flushSave({ sync: true }); }, Math.max(1000, SYNC_EVERY - (Date.now() - sync.at)));
+    }
     return saveChain;
+  }
+
+  /** 동기화 사본(압축)을 플러그인 저장소에 쓴다. json은 지금 떠 둔 내용이라 그 뒤 바뀐 것과 섞이지 않는다. */
+  function writeSync(key, json) {
+    clearTimeout(sync.timer);
+    sync.timer = null;
+    if (sync.last?.key === key && sync.last.json === json) return saveChain; // 벡터만 바뀌었으면 사본은 그대로
+    sync.last = { key, json };
+    sync.at = Date.now();
+    const at = state.savedAt ?? Date.now();
+    const n = state.events.length;
+    saveChain = saveChain.catch(() => {}).then(async () => {
+      const z = await packJson(json);
+      await R.pluginStorage.setItem(STORE + key, { fmt: 3, at, n, z });
+      saveStats.syncKB = Math.round(z.length / 1024);
+      saveStats.syncAt = Date.now();
+    }).catch(error => {
+      if (chatKey === key) sync.dirty = true;
+      if (sync.last?.json === json) sync.last = null;
+      if (!localStore) written.delete(STORE + key);
+      setError('동기화 저장', error);
+    });
+    return saveChain;
+  }
+
+  /** 기기 작업본을 읽는다. */
+  async function readLocal(key) {
+    if (!localStore) return null;
+    const core = await Promise.resolve().then(() => localStore.getItem(localCore(key))).catch(() => null);
+    if (!core || typeof core !== 'object' || !Array.isArray(core.chunks)) return null;
+    const ns = core.chunks;
+    const parts = await Promise.all(ns.map(n => Promise.resolve().then(() => localStore.getItem(localChunk(key, n))).catch(() => null)));
+    const events = [];
+    const seed = new Map();
+    let missing = 0;
+    ns.forEach((n, i) => {
+      if (!Array.isArray(parts[i])) { missing++; return; }
+      seed.set(localChunk(key, n), JSON.stringify(parts[i]));
+      events.push(...parts[i]);
+    });
+    if (missing) console.warn(LOG, '기기에 저장된 메모 묶음 일부를 못 읽었어요', missing);
+    const { chunks, savedAt, ...body } = core;
+    seed.set(localCore(key), JSON.stringify({ ...body, chunks }));
+    return { data: { ...body, savedAt, events }, at: savedAt ?? 0, seed, chunks: ns, missing };
+  }
+
+  /** 동기화 사본을 읽는다. 예전 한 덩어리 형식(1.3.x 이하)도 읽는다. */
+  async function readSynced(key) {
+    let v = await R.pluginStorage.getItem(STORE + key);
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch { v = null; } }
+    if (!v || typeof v !== 'object') return null;
+    if (v.fmt === 3 && typeof v.z === 'string') return { at: v.at ?? 0, n: v.n, load: async () => JSON.parse(await unpackJson(v.z)) };
+    if (Array.isArray(v.events)) return { at: -1, legacy: true, load: async () => v };
+    return null;
+  }
+
+  /** 채팅의 기억을 읽는다: 기기 작업본과 동기화 사본 중 더 최근 것. 벡터는 기기 것을 다시 쓴다. */
+  async function readSave(key) {
+    const [local, synced] = await Promise.all([readLocal(key), readSynced(key).catch(error => { setError('불러오기', error); return null; })]);
+    if (local && (!synced || local.at >= synced.at) && !local.missing) return { ...local, source: 'local' };
+    if (!synced) return local ? { ...local, source: 'local' } : null;
+    const data = await synced.load();
+    if (!data || !Array.isArray(data.events)) return local ? { ...local, source: 'local' } : null;
+    // 다른 기기에서 더 최근에 저장했다: 그쪽 기억을 쓰고, 글이 같은 메모는 이 기기 벡터를 그대로 쓴다
+    if (local) {
+      const old = new Map(local.data.events.map(e => [e.id, e]));
+      for (const e of data.events) {
+        const o = old.get(e.id);
+        if (!e.vec && o?.vec && o.t === e.t && (o.ctx ?? '') === (e.ctx ?? '')) { e.vec = o.vec; e.vp = o.vp; }
+      }
+    }
+    return { data, at: synced.at, seed: local?.seed ?? new Map(), chunks: local?.chunks ?? [], legacy: synced.legacy, source: 'synced' };
+  }
+
+  function bytesToB64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  /** JSON 글을 gzip + base64로 줄인다 (보통 1/4~1/5). 압축을 못 하는 환경이면 그대로. */
+  async function packJson(json) {
+    if (typeof CompressionStream === 'function') {
+      try {
+        const buf = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+        return `gz:${bytesToB64(new Uint8Array(buf))}`;
+      } catch { /* 압축이 안 되면 그냥 쓴다 */ }
+    }
+    return `js:${json}`;
+  }
+  async function unpackJson(body) {
+    if (body.startsWith('js:')) return body.slice(3);
+    if (!body.startsWith('gz:') || typeof DecompressionStream !== 'function') throw new Error('압축을 풀 수 없어요.');
+    const stream = new Blob([b64ToBytes(body.slice(3))]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return await new Response(stream).text();
+  }
+
+  // ── 채팅 로어북 백업 ──
+  // 플러그인 저장소는 세이브 파일에만 있다. 채팅을 다른 계정 · 기기로 옮길 때를 위해, 누를 때만 한 번
+  // 채팅 로어북에 압축한 백업 항목을 쓴다. @@dont_activate라 프롬프트에는 절대 안 들어간다.
+  // 플러그인 데이터가 없는 채팅을 열었는데 백업 항목이 있으면 거기서 되살린다.
+  const BACKUP_TAG = 'JEVHYPA-BACKUP';
+  const BACKUP_TITLE = 'JevHypa 기억 백업 (지우지 마세요)';
+  const isBackupEntry = (l) => typeof l?.content === 'string' && l.content.includes(`\n${BACKUP_TAG} `);
+
+  /** 백업에 넣을 것: 벡터 · 받은 편지함 · 마지막 주입은 뺀다(다시 만들 수 있다). */
+  function backupData() {
+    state.seen = [...seenSet].slice(-MAX_SEEN);
+    state.dict.rej = [...rejSet].slice(-4000);
+    const { inbox, lastRecall, backup, ...rest } = state;
+    return {
+      ...rest,
+      events: state.events.map(({ vec, vp, ...e }) => e),
+      arcs: state.arcs.map(a => ({ ...a, vec: null, vp: null })),
+    };
+  }
+
+  async function readLoreBackup(chat) {
+    const entry = (chat?.localLore ?? []).find(isBackupEntry);
+    if (!entry) return null;
+    try {
+      const lines = entry.content.split('\n');
+      const at = lines.findIndex(l => l.startsWith(`${BACKUP_TAG} `));
+      const data = JSON.parse(await unpackJson(lines.slice(at + 1).join('\n').trim()));
+      return data && Array.isArray(data.events) ? data : null;
+    } catch (error) { setError('백업 읽기', error); return null; }
+  }
+
+  /** 지금 기억을 채팅 로어북에 백업한다. 채팅 전체를 한 번 다시 쓰므로 답장을 기다리는 중에는 하지 않는다. */
+  async function backupToLore() {
+    if (!await ensureChat({ full: true })) throw new Error('채팅방을 먼저 열어 주세요.');
+    if (job) await job;
+    await flushSave({ sync: true });
+    const key = chatKey;
+    const payload = await packJson(JSON.stringify(backupData()));
+    const content = `@@dont_activate\n${BACKUP_TAG} 1 · 메모 ${state.events.length}개 · ${new Date().toLocaleString()}\n${payload}`;
+    // 압축을 먼저 끝내고, 채팅을 읽자마자 바로 쓴다 (그 사이 바뀔 틈을 줄인다)
+    const charIndex = await R.getCurrentCharacterIndex();
+    const chatIndex = await R.getCurrentChatIndex();
+    const chat = await R.getChatFromIndex(charIndex, chatIndex);
+    if (!chat || `${characterCache.chaId}_${chat.id || `idx${chatIndex}`}` !== key) throw new Error('채팅이 바뀌었어요. 다시 눌러 주세요.');
+    const lore = Array.isArray(chat.localLore) ? [...chat.localLore] : [];
+    const entry = { key: 'jevhypa-backup', secondkey: '', insertorder: 0, comment: BACKUP_TITLE, content, mode: 'normal', alwaysActive: false, selective: false, useRegex: false };
+    const at = lore.findIndex(isBackupEntry);
+    if (at >= 0) lore[at] = { ...lore[at], ...entry };
+    else lore.push(entry);
+    chat.localLore = lore;
+    await R.setChatToIndex(charIndex, chatIndex, chat);
+    rawChatObj = chat;
+    state.backup = { at: Date.now(), turn: state.turn, n: state.events.length, kb: Math.round(content.length / 1024) };
+    void persist();
+    return state.backup;
+  }
+
+  /** 채팅 로어북 백업으로 지금 기억을 바꾼다. */
+  async function restoreFromLore(chat = rawChatObj) {
+    const data = await readLoreBackup(chat);
+    if (!data) return false;
+    state = migrateState(data);
+    seenSet = new Set(state.seen);
+    rejSet = new Set(state.dict.rej);
+    gramCache = new Map();
+    matcherCache = null;
+    recallCache.clear();
+    void persist();
+    queueReembed();
+    return true;
+  }
+
+  /** 이 기기에 벡터가 없는 메모(다른 기기에서 만들었거나 백업에서 되살린 것)는 뒤에서 계산한다. */
+  function queueReembed() {
+    setTimeout(() => {
+      if (job || !chatKey || !ready() || state.off) return;
+      if (!state.events.some(e => !e.vec)) return;
+      const tr = beginTrace('reembed', 'bg');
+      let n = 0;
+      reembedRunning = true;
+      job = timed(tr, '벡터 다시 계산(이 기기)', () => reembedAll((done) => { n = done; }, { missingOnly: true }), () => `${n}개`)
+        .catch(error => setError('임베딩', error))
+        .finally(() => { endTrace(tr, 'bg'); job = null; reembedRunning = false; void persist(); });
+    }, 3000);
   }
 
   function gramsOf(ev) {
@@ -1985,10 +2286,10 @@
   }
 
   /** 임베딩 설정을 바꾼 뒤 옛 벡터를 새로 계산한다. */
-  async function reembedAll(onProgress) {
+  async function reembedAll(onProgress, { missingOnly = false } = {}) {
     const owner = state;
     const vp = embedProfile();
-    const todo = state.events.filter(e => e.vp !== vp);
+    const todo = state.events.filter(e => missingOnly ? !e.vec : e.vp !== vp);
     for (let i = 0; i < todo.length; i += EMBED_CHUNK) {
       const chunk = todo.slice(i, i + EMBED_CHUNK);
       const vecs = await embedTexts(chunk.map(e => embedText(e.t, e.ctx)));
@@ -3192,6 +3493,8 @@
     if (stats.lastError && Date.now() - stats.lastErrorAt < 10 * 60 * 1000) {
       return `<div class="banner bad"><div class="g"><b>최근 오류</b> <span class="small muted">${timeAgo(stats.lastErrorAt)}</span><div class="small err">${escapeHtml(stats.lastError)}</div><div class="small muted">처리 못 한 메시지는 원문 그대로 보냈어요.</div></div><button class="btn" data-act="tab" data-tab="settings">연결 확인</button></div>`;
     }
+    if (ui.restored?.key === chatKey) return `<div class="banner ok"><div class="g"><b>백업에서 되살렸어요</b><div class="small muted">플러그인 데이터가 없어서 채팅 로어북 백업에서 메모 ${ui.restored.n}개를 가져왔어요.</div></div><button class="btn" data-act="restored-ok">확인</button></div>`;
+    if (reembedRunning) return `<div class="banner warn"><div class="g"><b>이 기기에서 벡터 계산 중</b><div class="small muted">벡터는 기기마다 따로 저장해요. 다 될 때까지는 단어 겹침으로 찾아요.</div></div></div>`;
     const embedStale = state.events.some(e => e.vp !== embedProfile());
     if (embedStale) return `<div class="banner warn"><div class="g"><b>임베딩 다시 계산 필요</b><div class="small muted">임베딩 설정이 바뀌었거나 일부 메모에 벡터가 없어요. 그동안은 단어 겹침으로 찾아요.</div></div><button class="btn p" data-act="reembed">지금 계산</button></div>`;
     return `<div class="banner ok"><div class="g"><b>작동 중</b><div class="small muted">Risu가 보낸 원문은 그대로 두고, 보내지 않은 이전 대화만 메모로 넣어요</div></div><button class="btn" data-act="toggle-chat">이 채팅에서 끄기</button></div>`;
@@ -3553,6 +3856,7 @@
     send: ['📤 보낼 때', '응답이 이만큼 늦게 시작해요'],
     after: ['📥 답장 뒤', '뒤에서 해서 기다림 없음'],
     catchup: ['📂 채팅 열 때 정리', '뒤에서 해서 기다림 없음'],
+    reembed: ['🧮 이 기기 벡터 계산', '다른 기기에서 만든 메모 · 백업에서 되살린 메모'],
     manual: ['🧰 지금 전부 처리', ''],
   };
   const secs = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}초` : `${ms}ms`);
@@ -3580,6 +3884,7 @@
         <div class="card" style="margin:0"><div class="kpi">${sends.length ? secs(sends[0].ms) : '-'}</div><div class="small muted">마지막 보낼 때 지연</div></div>
         <div class="card" style="margin:0"><div class="kpi">${recent.length ? secs(avg(recent)) : '-'}</div><div class="small muted">보낼 때 평균 (최근 ${recent.length}번)</div></div>
         <div class="card" style="margin:0"><div class="kpi">${bgs.length ? secs(bgs[0].ms) : '-'}</div><div class="small muted">마지막 뒤에서 정리</div></div>
+        <div class="card" style="margin:0"><div class="kpi">${saveStats.lastAt ? secs(saveStats.lastMs) : '-'}</div><div class="small muted">마지막 저장${saveStats.lastAt ? ` · ${saveStats.lastKeys}조각 · ${(saveStats.lastBytes / 1024).toFixed(1)}KB (기기 전체 ${saveStats.totalKB}KB)` : ''}${saveStats.syncAt ? ` · 동기화 사본 ${saveStats.syncKB}KB ${timeAgo(saveStats.syncAt)}` : ''}</div></div>
       </div>
       <div class="row" style="margin:10px 0"><span class="small muted" style="flex:1">"보낼 때"만 응답을 늦춰요. 나머지는 답장을 받은 뒤 뒤에서 돌아요.</span><button class="btn sm" data-act="debug-clear">기록 지우기</button></div>
       ${debugLog.map(card).join('')}`;
@@ -3770,6 +4075,7 @@
       ${tool('인물 태그 다시 붙이기', '별명을 묶거나 인물을 추가한 뒤 쓰면 좋아요. Jev 호출 없음.', 'retag', '다시 붙이기')}
       ${tool('내보내기', `이 채팅의 대단원·장면·메모·사전을 파일로 저장해요. (지금 약 ${size}KB)`, 'export', '내보내기')}
       <div class="card row" style="justify-content:space-between"><div style="flex:1;min-width:200px"><b>가져오기</b><div class="help">내보낸 파일로 이 채팅의 기억을 바꿔요. 지금 것은 덮어써져요.</div></div><label class="btn">파일 선택<input type="file" id="imp" accept=".json,application/json" style="display:none"></label></div>
+      <div class="card"><div class="row" style="justify-content:space-between"><div style="flex:1;min-width:200px"><b>채팅에 기억 백업</b><div class="help">기억은 Risu 세이브 파일에 저장돼요. 채팅을 다른 계정으로 옮기거나 채팅만 내보낼 때를 위해, 이 채팅의 로어북에 압축한 백업을 한 번 써 둬요. 프롬프트에는 절대 안 들어가요. 플러그인 데이터가 없는 곳에서 이 채팅을 열면 자동으로 되살려요. 답장을 기다리는 중에는 누르지 마세요.</div>${state.backup ? `<div class="small muted" style="margin-top:4px">마지막 백업: ${escapeHtml(new Date(state.backup.at).toLocaleString())} · 메모 ${state.backup.n}개 · 약 ${state.backup.kb}KB${state.turn - state.backup.turn > 0 ? ` · 그 뒤로 ${state.turn - state.backup.turn}턴` : ''}</div>` : ''}</div><div class="row"><button class="btn" data-act="lore-restore">백업에서 되살리기</button><button class="btn p" data-act="lore-backup">백업</button></div></div></div>
       ${tool('지난 기억 비우기', '"지난 기억"으로 내려간 메모를 지워요.', 'purge-old', '비우기')}
       ${tool('처음부터 다시 정리', '메모·장면·대단원을 지우고 처리 기록을 초기화해요. 사전은 남아요. 다음 대화부터 다시 정리돼요.', 'rebuild', '다시 정리', true)}
       ${tool('이 채팅 기억 전부 삭제', '메모, 장면, 대단원, 사전, 처리 기록을 모두 지워요. 되돌릴 수 없어요.', 'clear', '전부 삭제', true)}`;
@@ -4158,6 +4464,30 @@
         return;
       }
       case 'retag': { const n = retagAll(); await changed(n ? `메모 ${n}개 태그를 고쳤어요.` : '바뀐 태그가 없어요.'); return; }
+      case 'restored-ok': ui.restored = null; render(); return;
+      case 'lore-backup': {
+        if (job) { toast('정리 중이에요. 끝나면 다시 눌러 주세요.'); return; }
+        try {
+          ui.progress = '채팅 로어북에 백업하는 중…';
+          render();
+          const b = await backupToLore();
+          ui.progress = '';
+          render();
+          toast(`백업했어요 · 메모 ${b.n}개 · 약 ${b.kb}KB`);
+        } catch (error) { ui.progress = ''; render(); toast(String(error?.message ?? error)); }
+        return;
+      }
+      case 'lore-restore': {
+        await ensureChat({ full: true });
+        const data = await readLoreBackup(rawChatObj);
+        if (!data) { toast('이 채팅 로어북에 백업이 없어요.'); return; }
+        if (!await confirmDialog(`백업의 메모 ${data.events.length}개로 이 채팅의 기억을 바꿀까요?\n지금 기억은 덮어써져요.`, '되살리기')) return;
+        if (job) await job;
+        await restoreFromLore(rawChatObj);
+        refreshPending();
+        await changed('백업에서 되살렸어요. 벡터는 뒤에서 다시 계산해요.');
+        return;
+      }
       case 'export': downloadJson(state, `jevhypa_${(chatLabel.char || 'chat').replace(/[\\/:*?"<>|]/g, '_')}.json`); return;
       case 'purge-old': {
         const n = state.events.filter(x => x.old && !x.pin).length;
@@ -4212,16 +4542,19 @@
         R.removeRisuReplacer('beforeRequest', beforeRequestHandler),
         R.removeRisuReplacer('afterRequest', afterRequestHandler),
         buttonPartId && R.unregisterUIPart ? R.unregisterUIPart(buttonPartId) : null,
+        flushSave({ sync: true }),
       ]);
     });
   }
   await syncButton();
+  await initLocalStore();
+  try { globalThis.addEventListener?.('pagehide', () => { void flushSave({ sync: true }); }); } catch { }
   try { await ensureChat(); } catch { }
   console.log(LOG, '준비 완료 · 메모', state.events.length, '개');
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, renderDebug, debugLog: () => debugLog, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, stableOrder, bondTile, intimacyOf, flushSave, persist, backupToLore, readLoreBackup, restoreFromLore, saveStats, splitState, setLocalStore: (v) => { localStore = v; }, packJson, saveChainNow: () => saveChain, renderDebug, debugLog: () => debugLog, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
