@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.3.0
+//@version 1.3.1
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
