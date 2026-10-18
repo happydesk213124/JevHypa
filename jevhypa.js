@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.2.0
+//@version 1.3.0
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -69,8 +69,9 @@
   };
 
   const MODES = {
+    lean: { label: '하이파식', badge: '추천', desc: '최근 2개만 원문으로 보내고, 그 앞은 전부 기억(이 장면 흐름 + 관계 + 회상)으로 바꿔요. 토큰이 가장 적어요.', rawBudget: 0, minRaw: 2, recallBudget: 1400, eventsPerScene: 4, candidates: 24, arcs: 3 },
     save: { label: '절약', desc: '원문을 적게 남기고 메모도 짧게. 토큰이 가장 적어요.', rawBudget: 3000, minRaw: 4, recallBudget: 700, eventsPerScene: 2, candidates: 16, arcs: 2 },
-    balanced: { label: '균형', badge: '추천', desc: '대부분의 롤플에 맞는 기본값.', rawBudget: 6000, minRaw: 6, recallBudget: 1200, eventsPerScene: 4, candidates: 24, arcs: 3 },
+    balanced: { label: '균형', desc: '최근 대화를 넉넉히 원문으로 두고 오래된 것만 기억으로.', rawBudget: 6000, minRaw: 6, recallBudget: 1200, eventsPerScene: 4, candidates: 24, arcs: 3 },
     quality: { label: '품질', desc: '원문을 많이 남기고 메모도 넉넉히. 토큰이 더 들어요.', rawBudget: 12000, minRaw: 10, recallBudget: 2000, eventsPerScene: 6, candidates: 40, arcs: 4 },
   };
   const MODE_KEYS = ['rawBudget', 'minRaw', 'recallBudget', 'eventsPerScene', 'candidates', 'arcs'];
@@ -86,12 +87,12 @@
     // 주소·모델은 비워 두면 고른 프리셋 값으로 채워진다(sanitizeSettings)
     jevPreset: 'openrouter', jevKey: '', jevEndpoint: '', jevModel: '',
     embedPreset: 'openrouter', embedKey: '', embedEndpoint: '', embedModel: '', embedDims: 512,
-    mode: 'balanced', ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES.balanced[k]])),
+    mode: 'lean', ...Object.fromEntries(MODE_KEYS.map(k => [k, MODES.lean[k]])),
     recallThreshold: 50, saveThreshold: 55,
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
     injectMode: 'last_user', injectStyle: 'memo', injectLabel: 'Memory', note: DEFAULT_NOTE, showStoryTime: true,
-    cards: true, bonds: true,
+    cards: true, bonds: true, autoCatchUp: true,
     translate: 'off', translateKey: '', translateModel: 'google/gemini-2.5-flash-lite',
     showButton: true,
   };
@@ -119,7 +120,8 @@
   const MAX_WORD_QUESTIONS = 20;
   const SPEAKER_ACTIVE_COUNT = 2;
   const QUERY_MESSAGES = 6;
-  const SECOND_SEARCH = 6;            // 빠진 근거를 찾을 때 더 볼 메모 수
+  const SECOND_SEARCH = 6;
+  const BRIDGE_MAX_TOKENS = 400;      // "이 장면 흐름" 최대 토큰            // 빠진 근거를 찾을 때 더 볼 메모 수
   const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
 
   const KINDS = {
@@ -671,9 +673,9 @@
       embedEndpoint: str(s.embedEndpoint),
       embedModel: str(s.embedModel),
       embedDims: clampNum(s.embedDims, 512, 64, 4096),
-      mode: MODES[s.mode] || s.mode === 'custom' ? s.mode : 'balanced',
-      rawBudget: clampNum(s.rawBudget, 6000, 500, 200000),
-      minRaw: clampNum(s.minRaw, 6, 2, 100),
+      mode: MODES[s.mode] || s.mode === 'custom' ? s.mode : 'lean',
+      rawBudget: clampNum(s.rawBudget, 0, 0, 200000),
+      minRaw: clampNum(s.minRaw, 2, 2, 100),
       recallBudget: clampNum(s.recallBudget, 1200, 0, 20000),
       eventsPerScene: clampNum(s.eventsPerScene, 4, 1, 20),
       candidates: clampNum(s.candidates, 24, 4, 200),
@@ -694,6 +696,7 @@
       showStoryTime: bool('showStoryTime'),
       cards: bool('cards'),
       bonds: bool('bonds'),
+      autoCatchUp: bool('autoCatchUp'),
       translate: TRANSLATORS[s.translate] ? s.translate : 'off',
       translateKey: cleanKey(str(s.translateKey)),
       translateModel: str(s.translateModel) || DEFAULT_SETTINGS.translateModel,
@@ -752,7 +755,11 @@
         err.status = resp.status;
         throw err;
       }
-      return await resp.json();
+      try {
+        return await resp.json();
+      } catch {
+        throw new Error(`${label} 응답을 읽지 못했어요. 주소나 형식이 맞는지 확인해 주세요.`);
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -1012,11 +1019,34 @@
     const persona = await personaName(id.chatObj);
     personaCache = persona && persona !== 'User' ? persona : '';
     if (personaCache) addEntity(personaCache, 'person', 'persona', 99);
+    queueCatchUp();
     if (!state.loreSeeded) {
       const lore = [...characterCache.lore, ...(id.chatObj?.localLore ?? [])];
       state.loreQueue = [...new Set([...(id.char && !state.dict.e[id.char] ? [id.char] : []), ...lore.flatMap(l => String(l?.key ?? '').split(',')).map(k => k.trim()).filter(k => k.length >= 2 && k.length <= 12)])].slice(0, 60);
     }
     return true;
+  }
+
+  // 채팅을 열면 아직 정리 안 된 메시지를 뒤에서 정리한다. 정리 안 된 메시지는 원문으로 보내야 해서 토큰을 먹는다.
+  const CATCHUP_MIN = 3;
+  const CATCHUP_MAX = 300;
+  function queueCatchUp() {
+    if (!settings.autoCatchUp) return;
+    setTimeout(() => { void catchUp(); }, 1500);
+  }
+  async function catchUp() {
+    if (job || !ready() || state.off || !chatKey) return;
+    const key = chatKey;
+    const raw = rawEntries();
+    if (!raw.length || orderGap(raw)) return;
+    const todo = ingestTargets(raw).slice(0, CATCHUP_MAX);
+    if (todo.length < CATCHUP_MIN) return;
+    const show = () => { try { if (document.getElementById('bd')) render(); } catch { /* 화면이 닫혀 있으면 그냥 둔다 */ } };
+    ui.progress = `밀린 메시지 정리 중 · 0/${todo.length}`;
+    show();
+    job = ingest(todo, settings, Infinity, (done) => { ui.progress = `밀린 메시지 정리 중 · ${done}/${todo.length}`; show(); })
+      .catch(error => setError('밀린 메시지 정리', error))
+      .finally(() => { job = null; ui.progress = ''; if (chatKey === key) refreshPending(); void persist(); show(); });
   }
 
   let saveChain = Promise.resolve();
@@ -1504,7 +1534,9 @@
     const added = [];
     units.forEach((u, j) => {
       const p = choiceProbs(A[`k${j}`], Object.keys(KIND_OPTIONS));
-      const imp = Math.max(0, Math.min(1, 1 - p.trivial - (p.ask ?? 0) - 0.6 * p.minor)); // 질문·요청은 사실이 아니라 저장하지 않는다
+      let imp = Math.max(0, Math.min(1, 1 - p.trivial - (p.ask ?? 0) - 0.6 * p.minor)); // 질문·요청은 사실이 아니라 저장하지 않는다
+      // 숫자가 든 사실(날짜·금액·수량·번호)은 한번 잃으면 되살릴 수 없어서 조금 더 쳐준다. 잡담·질문은 그대로.
+      if (imp >= cfg.saveThreshold / 100 && /\d/.test(u.text.replace(/^[^:"“]{1,15}:\s/, ''))) imp = Math.min(1, imp + 0.1);
       if (imp < cfg.saveThreshold / 100) return;
       const kind = argmax(Object.fromEntries(KIND_IDS.map(k => [k, p[k]]))) ?? 'event';
       const b = batch[u.bi];
@@ -2351,12 +2383,25 @@
       }
     }
 
+    // ── 이 장면 흐름: 원문에서 빠진 지금 장면의 메모를 시간순으로 먼저 자리 잡는다(방금 흐름이 끊기지 않게) ──
+    const bridge = [];
+    let bridgeCost = 0;
+    const bridgeBudget = Math.min(BRIDGE_MAX_TOKENS, Math.round(cfg.recallBudget * 0.4));
+    for (const e of pool.filter(x => x.scene === state.open.scene && x.kind !== 'outfit').sort((a, b) => b.id - a.id)) {
+      const cost = estimateTokens(lineText(e, cfg)) + 6;
+      if (bridgeCost + cost > bridgeBudget) break;
+      bridgeCost += cost;
+      bridge.unshift(e);
+    }
+    const inBridge = new Set(bridge.map(e => e.id));
+
     // ── 선택 ──
     const threshold = (e) => cfg.recallThreshold / 100 * (coreOfCast(e) ? CORE_FACTOR : 1);
     const ordered = [...judged.filter(x => x.e.pin), ...judged.filter(x => !x.e.pin && x.p >= threshold(x.e)).sort((a, b) => b.p - a.p)];
     const picks = [];
-    let budget = cfg.recallBudget;
+    let budget = cfg.recallBudget - bridgeCost;
     for (const x of ordered) {
+      if (inBridge.has(x.e.id)) continue;
       const cost = estimateTokens(lineText(x.e, cfg)) + 6;
       if (cost > budget) continue;
       if (!x.e.pin && picks.some(p => dice(gramsOf(p.e), gramsOf(x.e)) >= DIVERSITY_DICE)) continue;
@@ -2366,7 +2411,7 @@
     // 지금 장면에 나온 인물의 최신 옷·상태는 (원문에서 잘려 나갔다면) 항상 넣는다. 장면이 이어질 때 옷이 바뀌는 실수를 막는다.
     for (const name of sc.cast) {
       const o = pool.filter(e => e.kind === 'outfit' && e.who[0] === name && e.arc === state.open.arc).sort((a, b) => b.id - a.id)[0];
-      if (!o || picks.some(x => x.e === o)) continue;
+      if (!o || picks.some(x => x.e === o) || inBridge.has(o.id)) continue;
       const cost = estimateTokens(lineText(o, cfg)) + 6;
       if (cost > budget) continue;
       budget -= cost;
@@ -2375,7 +2420,7 @@
     // 지금 장면(또는 최신 메시지)에 나온 사람의 진행 중인 약속·계획은 넣는다. 캐릭터가 약속을 잊지 않게.
     if (cfg.bonds) {
       const who = new Set([...sc.cast, ...findEntities(sc.focusText).person]);
-      const threads = pool.filter(e => isThread(e) && e.who.some(w => who.has(w)) && !picks.some(x => x.e === e)).sort((a, b) => b.id - a.id).slice(0, 2);
+      const threads = pool.filter(e => isThread(e) && e.who.some(w => who.has(w)) && !picks.some(x => x.e === e) && !inBridge.has(e.id)).sort((a, b) => b.id - a.id).slice(0, 2);
       for (const t of threads) {
         const cost = estimateTokens(lineText(t, cfg)) + 6;
         if (cost > budget) continue;
@@ -2387,8 +2432,9 @@
     const pickIds = new Set(picks.map(x => x.e.id));
     trace.arcs = arcScores.slice(0, 6).map(x => ({ id: x.a.id, title: arcTitle(x.a), s: round2(x.s), chosen: chosenIds.has(x.a.id), p: trace.arcP?.[x.a.id] != null ? round2(trace.arcP[x.a.id]) : null }));
     trace.cands = judged.map(x => ({ id: x.e.id, s: round2(x.s), p: x.pm == null ? null : round2(x.p), pick: pickIds.has(x.e.id), second: !!x.second })).sort((a, b) => (b.p ?? -1) - (a.p ?? -1));
+    trace.bridge = bridge.map(e => e.id);
     trace.ms = Date.now() - started;
-    return { picks, trace, sc };
+    return { picks, trace, sc, bridge };
   }
 
   const round2 = (n) => Math.round(n * 100) / 100;
@@ -2415,7 +2461,7 @@
     return clip((keep.length ? keep : parts.slice(0, 1)).join(' '), 140);
   }
 
-  function formatMemories(picks, sc, cfg = settings) {
+  function formatMemories(picks, sc, cfg = settings, bridge = []) {
     const arc = arcById(state.open.arc);
     const arcLine = arc && (arc.kw.length || arc.cast.length)
       ? `<current chapter> ${arc.title || `#${state.arcs.indexOf(arc) + 1}`}${whenTag(arc.from) ? ` · from ${whenTag(arc.from)}` : ''}${arc.places.length ? ` · ${arc.places.slice(0, 2).join(', ')}` : ''}${arc.kw.length ? ` · ${arc.kw.slice(0, 6).join(', ')}` : ''}`
@@ -2431,7 +2477,7 @@
     const featured = new Set([...present, ...asked, ...(personaCache && isPerson(canonical(personaCache)) ? [canonical(personaCache)] : [])]);
     const headers = new Map();
     if (cfg.bonds) for (const n of featured) { const h = personHeader(n, featured, present); if (h) headers.set(n, h); }
-    if (!picks.length && !arcLine && !headers.size) return '';
+    if (!picks.length && !arcLine && !headers.size && !bridge.length) return '';
     const label = cfg.injectLabel;
     const line = (e, group) => {
       const w = cfg.showStoryTime ? whenTag(e.when) : '';
@@ -2454,7 +2500,7 @@
       const ctx = cfg.cards && e.ctx && bare && !pickedTexts.has(e.ctx) ? ` (context: ${clip(e.ctx, 60)})` : '';
       return `- ${w ? `[${w}] ` : ''}${tags.length ? `(${tags.join(', ')}) ` : ''}${text}${ctx}`;
     };
-    const pickedTexts = new Set(picks.map(x => clip(x.e.t, 90)));
+    const pickedTexts = new Set([...picks.map(x => x.e), ...bridge].map(e => clip(e.t, 90)));
     const groups = new Map();
     for (const { e } of picks) {
       const key = e.who[0] ?? (e.kind === 'world' ? WORLD : '기타');
@@ -2467,7 +2513,9 @@
     const groupName = (k) => (k === WORLD ? 'World' : k === '기타' ? 'Other' : k);
     const body = order.map(k => [`<${groupName(k)}>${headers.has(k) ? ` ${headers.get(k)}` : ''}`, ...groups.get(k).map(e => line(e, k))].join('\n')).join('\n');
     const note = cfg.note && cfg.translate !== 'off' ? `${cfg.note} Names may be romanized.` : cfg.note;
-    return [`[${label}]`, note, arcLine + prevLine, body, `[/${label}]`].filter(Boolean).join('\n');
+    // 원문 바로 앞에 붙는 자리: 이 장면에서 방금 전까지의 흐름
+    const flow = bridge.length ? ['<earlier in this scene>', ...bridge.map(e => line(e, ''))].join('\n') : '';
+    return [`[${label}]`, note, arcLine + prevLine, body, flow, `[/${label}]`].filter(Boolean).join('\n');
   }
 
   // 메모 줄만 영어로. 같은 줄은 이번 실행 동안만 기억해 두고 다시 번역하지 않는다(저장하지 않음).
@@ -2625,9 +2673,9 @@
       const kept = entries.filter(e => !drop.has(e.index));
       const visible = new Set(kept.flatMap(e => [e.key, e.hash]));
 
-      const { picks, trace, sc } = await recall(entries, visible, cfg);
+      const { picks, trace, sc, bridge } = await recall(entries, visible, cfg);
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
-      const block = await translateBlock(formatMemories(picks, sc, cfg), cfg);
+      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge), cfg);
       const injectedTokens = block ? estimateTokens(block) : 0;
       state.savedTokens = (state.savedTokens ?? 0) + Math.max(0, droppedTokens - injectedTokens);
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
@@ -2699,7 +2747,7 @@
   //  화면
   // ══════════════════════════════════════════════════════════════════════
 
-  const ui = { relFocus: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
+  const ui = { relFocus: null, openDays: new Set(), daysAll: null, arcsAll: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
 
   const CSS = `
     :root{--a:#5b7cfa;--ok:#3fae7a;--warn:#e0a03a;--bad:#e0605a}
@@ -2784,6 +2832,10 @@
     .arch{display:flex;gap:10px;align-items:center;padding:12px 14px;cursor:pointer;background:var(--darkbg,#1b1c22);flex-wrap:wrap}
     .arch .t{font-weight:700;flex:1;min-width:160px}
     .scene{padding:10px 14px;border-top:1px solid var(--borderc,#2c2e36)}
+    .day{border-top:1px solid var(--borderc,#2c2e36)}
+    .dayh{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;min-height:40px;background:none;border:none;color:inherit;padding:8px 14px;cursor:pointer;font-size:13px;font-weight:500;text-align:left}
+    .dayh:hover{background:rgba(139,141,151,.08)}
+    .dayh:focus-visible{outline:2px solid var(--a);outline-offset:-2px}
     .sceneh{font-size:12px;color:var(--textcolor2,#8d909a);margin-bottom:6px}
     .ev{padding:7px 0 7px 10px;border-left:2px solid var(--borderc,#383b46);margin:4px 0}
     .ev.old{opacity:.55}
@@ -3058,6 +3110,14 @@
     </div>`;
   }
 
+  // 장면의 날짜: 상태줄 날짜가 있으면 그 날, 없으면 이야기 속 N일차
+  const dayKey = (s) => s.from?.d ?? (Number.isFinite(s.from?.day) ? `Day ${s.from.day}` : '날짜 모름');
+  function dayLabel(k) {
+    if (!/^\d{4}-\d\d-\d\d$/.test(k)) return k.replace(/^Day (\d+)$/, '$1일차');
+    const wd = '일월화수목금토'[new Date(`${k}T00:00:00`).getDay()];
+    return `${k.slice(5)}${wd ? ` (${wd})` : ''}`;
+  }
+
   function renderTimeline() {
     const q = ui.query.trim().toLowerCase();
     const lastP = new Map((state.lastRecall?.picks ?? []).map(p => [p.id, p.p]));
@@ -3067,12 +3127,28 @@
     const html = arcs.map(a => {
       const scenes = a.sceneIds.map(sceneById).filter(Boolean);
       const evCount = state.events.filter(e => e.arc === a.id && isActive(e)).length;
-      // 지금 대단원은 기본으로 펼침, 다른 대단원은 기본으로 접힘. 누르면 반대로.
-      const open = filtering || (ui.openArcs.has(a.id) !== (a.id === state.open.arc));
-      const sceneHtml = open ? [...scenes].reverse().map(s => {
+      // 지금 대단원은 기본으로 펼침, 다른 대단원은 기본으로 접힘. 누르면 반대로. "모두 펼치기/접기"를 누르면 그 상태가 기본.
+      const open = filtering || ((ui.arcsAll ?? (a.id === state.open.arc)) !== ui.openArcs.has(a.id));
+      const sceneBlock = (s) => {
         const evs = state.events.filter(e => e.scene === s.id && match(e));
         if (!evs.length) return filtering ? '' : `<div class="scene"><div class="sceneh">${escapeHtml([formatWhen(s.from, true), s.place].filter(Boolean).join(' · ') || '장면')} · 남길 메모 없음</div></div>`;
         return `<div class="scene"><div class="sceneh">🎬 ${escapeHtml([formatWhen(s.from, true), s.place, s.cast.join(', ')].filter(Boolean).join(' · ') || '장면')}</div>${evs.map(e => evRow(e, lastP.get(e.id))).join('')}</div>`;
+      };
+      // 대단원 안에서 장면을 날짜별로 묶는다. 가장 최근 날짜만 기본으로 펼친다.
+      const days = [];
+      for (const s of [...scenes].reverse()) {
+        const k = dayKey(s);
+        let g = days.find(x => x.k === k);
+        if (!g) days.push(g = { k, scenes: [] });
+        g.scenes.push(s);
+      }
+      const sceneHtml = open ? days.map((g, i) => {
+        const key = `${a.id}|${g.k}`;
+        const dOpen = filtering || ((ui.daysAll ?? i === 0) !== ui.openDays.has(key));
+        const inner = dOpen ? g.scenes.map(sceneBlock).join('') : '';
+        if (filtering && !inner.trim()) return '';
+        const n = g.scenes.reduce((c, s) => c + state.events.filter(e => e.scene === s.id && isActive(e)).length, 0);
+        return `<div class="day"><button class="dayh" data-act="day-toggle" data-key="${escapeHtml(key)}" aria-expanded="${dOpen}"><span>${dOpen ? '▾' : '▸'} 📅 ${escapeHtml(dayLabel(g.k))}</span><span class="small muted">장면 ${g.scenes.length} · 메모 ${n}</span></button>${inner}</div>`;
       }).join('') : '';
       if (filtering && !sceneHtml.trim()) return '';
       return `<div class="arc"><div class="arch" data-act="arc-toggle" data-id="${a.id}">
@@ -3086,6 +3162,7 @@
     return `<div class="row" style="margin-bottom:10px"><input class="inp" id="q" style="flex:1;min-width:160px" placeholder="🔍 메모 검색" value="${escapeHtml(ui.query)}">
         <select class="sel" data-act="who-select" style="width:auto;min-width:120px"><option value="">👥 모든 인물</option>${personList(200).map(n => `<option value="${escapeHtml(n)}"${ui.who === n ? ' selected' : ''}>${escapeHtml(n)}</option>`).join('')}</select>
         <button class="btn p" data-act="new">+ 메모 추가</button></div>
+      ${state.arcs.length ? `<div class="row" style="margin:-2px 0 10px;gap:6px"><button class="btn sm" data-act="days-all" data-open="1">모두 펼치기</button><button class="btn sm" data-act="days-all" data-open="0">모두 접기</button><span class="small muted">날짜 줄을 누르면 그날만 접고 펼 수 있어요.</span></div>` : ''}
       ${html || `<div class="card muted" style="text-align:center">${state.events.length ? '조건에 맞는 메모가 없어요.' : '아직 메모가 없어요.<br>대화가 쌓여 오래된 메시지가 생기면 장면과 대단원으로 정리돼요.'}</div>`}`;
   }
 
@@ -3321,8 +3398,8 @@
     const entries = [...base, { index: -1, role: 'user', text, hash: dryHash, key: `h:${dryHash}` }];
     const { outside } = splitRaw(entries, settings);
     const visible = new Set(entries.filter(e => !outside.includes(e) || !isSeen(e)).flatMap(e => [e.key, e.hash]));
-    const { picks, trace, sc } = await recall(entries, visible, settings, { dry: true });
-    const preview = await translateBlock(formatMemories(picks, sc, settings), settings);
+    const { picks, trace, sc, bridge } = await recall(entries, visible, settings, { dry: true });
+    const preview = await translateBlock(formatMemories(picks, sc, settings, bridge), settings);
     return { ...trace, preview, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
   }
 
@@ -3336,7 +3413,7 @@
       <div class="sec">임베딩</div><div class="card">${embedFields(d)}</div>
       <div class="sec">모드</div><div class="card">${modeFields(d)}
         <details${d.mode === 'custom' ? ' open' : ''}><summary>숫자로 직접 조절</summary>
-          ${field('원문 예산 (토큰)', '최근 대화를 이만큼 원문으로 보내요. 그보다 오래된 건 메모로 대체돼요.', num('rawBudget', 500, 200000))}
+          ${field('원문 예산 (토큰)', '최근 대화를 이만큼 원문으로 보내요. 그보다 오래된 건 메모로 대체돼요.', num('rawBudget', 0, 200000))}
           ${field('원문 최소 개수', '예산과 상관없이 최근 이만큼은 꼭 원문으로.', num('minRaw', 2, 100))}
           ${field('메모 주입 예산 (토큰)', '0이면 회상을 끕니다.', num('recallBudget', 0, 20000))}
           ${field('장면당 메모 수', '장면마다 중요한 사건 몇 개만 남길지. 적을수록 쓸모없는 메모가 줄어요.', num('eventsPerScene', 1, 20))}
@@ -3353,6 +3430,7 @@
         ${field('비우는 간격 (턴)', '', `<input class="inp" type="number" inputmode="numeric" min="10" max="10000" data-field="rejClearEvery" value="${escapeHtml(d.rejClearEvery)}">`)}
         ${field('메모 압축', '말버릇을 빼고, 메모가 처음 쓰일 때 Jev가 원문에서 필요한 단어만 골라 짧게 만들어요. 원문은 보관돼요.', sw('compress', d.compress))}
         ${field('카드로 정리', '메모마다 형식(말·규칙·소문…), 지금도 유효한지, 누구 얘기인지, 앞 문장을 Jev로 붙여요. 메모당 Jev 문항이 2~3개 늘어요.', sw('cards', d.cards))}
+        ${field('채팅 열 때 밀린 메시지 정리', '채팅을 열면 아직 정리 안 된 메시지를 뒤에서 바로 정리해요(한 번에 최대 300개). 정리 안 된 메시지는 원문으로 보내야 해서 토큰을 먹어요. 아주 긴 채팅은 처음 한 번 Jev 비용이 들어요.', sw('autoCatchUp', d.autoCatchUp))}
         ${field('관계·기분 추적', '누가 누구를 어떻게 부르는지(호칭·존댓말), 사이가 가까워졌는지 멀어졌는지, 기분과 마지막 위치를 쌓아요. 관계 탭에서 보고 고칠 수 있고, 지금 장면 사람의 관계가 메모에 한 줄로 들어가요. 저장할 때 Jev 문항이 몇 개 늘어요.', sw('bonds', d.bonds))}
         ${field('바뀐 기억 정리', '새 메모가 옛 메모를 뒤집으면 옛 것을 "지난 기억"으로 내려요. 같은 말 반복도 걸러요.', sw('supersede', d.supersede))}
       </div>
@@ -3365,6 +3443,7 @@
         ${field('메모 번역 (보낼 때만)', '메인 모델에 보내기 직전에 메모 줄만 영어로 바꿔 토큰을 아껴요. 저장된 메모는 한국어 그대로예요. 구글 무료는 공식 API가 아니라 언제든 막힐 수 있어요.', `<select class="sel" data-field="translate">${Object.entries(TRANSLATORS).map(([k, v]) => `<option value="${k}"${d.translate === k ? ' selected' : ''}>${v}</option>`).join('')}</select>`)}
         <div data-tr="deepl llm" style="${d.translate === 'deepl' || d.translate === 'llm' ? '' : 'display:none'}">${field('번역 키', 'DeepL: API 키 (무료 키는 :fx로 끝나요) · LLM: OpenRouter 키 (비우면 Jev 키)', `<input class="inp" type="password" autocomplete="off" data-field="translateKey" value="${escapeHtml(d.translateKey)}">`)}</div>
         <div data-tr="llm" style="${d.translate === 'llm' ? '' : 'display:none'}">${field('번역 모델', 'OpenRouter 모델 ID', `<input class="inp" data-field="translateModel" value="${escapeHtml(d.translateModel)}">`)}</div>
+        <div data-tr="deepl llm google" style="${d.translate === 'off' ? 'display:none' : ''}"><div class="row"><button class="btn" data-act="test-translate">번역 테스트</button>${testLine('translate')}</div></div>
       </div>
       <div class="sec">화면</div><div class="card">
         ${field('우측 상단 바로가기', '채팅 화면에 🧠 버튼을 띄워요.', sw('showButton', d.showButton))}
@@ -3444,6 +3523,13 @@
         const { answers, model } = await callJev('[STORY]\n서진은 민우에게 토요일에 바다에 가자고 약속했다.', { t: { type: 'noul', instructions: 'Did 서진 make a promise about going to the sea?' } }, d);
         const p = noulProb(answers.t);
         ui.test.jev = p > 0.5 ? { ok: true, msg: `연결됨 · ${Date.now() - started}ms · ${model}` } : { warn: true, msg: `연결은 됐지만 판단이 이상해요 (${Math.round(p * 100)}%). 모델 이름을 확인해 보세요.` };
+      } else if (which === 'translate') {
+        if (d.translate === 'off') throw new Error('번역 방식을 먼저 고르세요.');
+        const fn = d.translate === 'deepl' ? viaDeepl : d.translate === 'llm' ? viaLlm : viaGoogle;
+        const [out] = await fn(['유나: "아카데미에는 규칙이 하나 있어. 해가 지면 숲에 들어가지 말 것."'], d);
+        ui.test.translate = out && !HANGUL.test(out)
+          ? { ok: true, msg: `연결됨 · ${Date.now() - started}ms · ${clip(out, 90)}` }
+          : { warn: true, msg: out ? `응답은 왔지만 영어가 아니에요: ${clip(out, 60)}` : '응답은 왔지만 번역 결과가 비어 있어요.' };
       } else {
         const [a, b, c] = await embedTexts(['토요일에 바다에 가기로 약속했다', '주말에 해변 가자고 했다', '검은 성의 기사단'], d);
         const near = dot(a, b), far = dot(a, c);
@@ -3608,6 +3694,7 @@
       }
       case 'test-jev': await runTest('jev'); return;
       case 'test-embed': await runTest('embed'); return;
+      case 'test-translate': await runTest('translate'); return;
       case 'wizard': ui.wiz = { step: 1, d: { ...settings }, manual: true }; render(); return;
       case 'wiz-back': currentDraft(); ui.wiz.step--; render(); return;
       case 'wiz-next': {
@@ -3643,6 +3730,19 @@
         if (e.target.closest('[data-act="arc-rename"]')) return;
         const aid = Number(el.dataset.id);
         if (ui.openArcs.has(aid)) ui.openArcs.delete(aid); else ui.openArcs.add(aid);
+        render();
+        return;
+      }
+      case 'day-toggle': {
+        const key = el.dataset.key;
+        if (ui.openDays.has(key)) ui.openDays.delete(key); else ui.openDays.add(key);
+        render();
+        return;
+      }
+      case 'days-all': {
+        ui.arcsAll = ui.daysAll = el.dataset.open === '1';
+        ui.openArcs.clear();
+        ui.openDays.clear();
         render();
         return;
       }
@@ -3887,7 +3987,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, splitRaw, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
