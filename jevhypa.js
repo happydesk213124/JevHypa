@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 0.0.1
+//@version 0.0.2
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -3020,6 +3020,7 @@
     for (let i = 0; i < prev.length; i++) {
       const L = prev.length - i;
       if (L < 2) break;
+      if (!head.some(c => same(prev[i], c))) continue; // 겹침은 이번 요청에 있는 메시지에서 시작해야 한다
       let j = 0, hit = 0;
       for (let k = i; k < prev.length; k++) {
         const at = head.findIndex((c, x) => x >= j && same(prev[k], c));
