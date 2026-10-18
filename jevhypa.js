@@ -1,7 +1,7 @@
 //@name jevhypa
 //@display-name JevHypa
 //@api 3.0
-//@version 1.1.0
+//@version 1.2.0
 //@update-url https://raw.githubusercontent.com/happydesk213124/JevHypa/main/jevhypa.js
 //@arg jev_api_key string (선택) OpenRouter API 키. 🧠 JevHypa 화면의 시작 안내에서 넣어도 됩니다.
 
@@ -91,7 +91,7 @@
     parseSpeakers: true, parseStatus: true, classifyWords: true, compress: true, supersede: true,
     rejAutoClear: false, rejClearEvery: 100,
     injectMode: 'last_user', injectStyle: 'memo', injectLabel: 'Memory', note: DEFAULT_NOTE, showStoryTime: true,
-    cards: true,
+    cards: true, bonds: true,
     translate: 'off', translateKey: '', translateModel: 'google/gemini-2.5-flash-lite',
     showButton: true,
   };
@@ -693,6 +693,7 @@
       note: typeof s.note === 'string' && s.note.trim() !== OLD_DEFAULT_NOTE ? s.note.trim() : DEFAULT_NOTE,
       showStoryTime: bool('showStoryTime'),
       cards: bool('cards'),
+      bonds: bool('bonds'),
       translate: TRANSLATORS[s.translate] ? s.translate : 'off',
       translateKey: cleanKey(str(s.translateKey)),
       translateModel: str(s.translateModel) || DEFAULT_SETTINGS.translateModel,
@@ -940,6 +941,7 @@
       clock: { d: null, t: null, place: null, approx: false, day: 1 },
       open: { arc: null, scene: null },
       savedTokens: 0, lastRecall: null, scene: null, pending: 0, loreSeeded: false,
+      bonds: {}, people: {},
     };
   }
 
@@ -1188,6 +1190,15 @@
     for (const e of state.events) e.who = [...new Set(e.who.map(w => (w === name ? target : w)))];
     for (const a of state.arcs) a.cast = [...new Set(a.cast.map(w => (w === name ? target : w)))];
     for (const s of state.scenes) s.cast = [...new Set(s.cast.map(w => (w === name ? target : w)))];
+    for (const [k, bd] of Object.entries(state.bonds ?? {})) {
+      if (bd.a !== name && bd.b !== name) continue;
+      delete state.bonds[k];
+      const a = bd.a === name ? target : bd.a, b = bd.b === name ? target : bd.b;
+      if (a === b) continue;
+      const nk = bondKey(a, b), cur = state.bonds[nk];
+      state.bonds[nk] = cur ? { ...bd, ...cur, a, b, hist: [...bd.hist, ...cur.hist].slice(-12) } : { ...bd, a, b };
+    }
+    if (state.people?.[name]) { state.people[target] ??= state.people[name]; delete state.people[name]; }
     state.dict.sug = state.dict.sug.filter(s => !(s.from === name && s.to === target));
     matcherCache = null;
     recallCache.clear();
@@ -1485,6 +1496,8 @@
       touchedArcs.add(scene.arc);
     });
 
+    job.touched = cfg.bonds ? trackSpeech(batch) : new Map();
+
     // 사건 메모 후보 → 장면마다 상위 N개만
     matcherCache = null;
     const recent = state.events.slice(-300).map(ev => ({ ev, g: gramsOf(ev) }));
@@ -1574,6 +1587,10 @@
         aboutOpts.set(j, { speaker, opts });
         qb[`o${j}`] = { type: 'choice', instructions: `Who or what is «${e.t}» mainly about?`, criteria: opts };
       });
+      const bondPairList = cfg.bonds ? interactionPairs(fresh, job.touched ?? new Map()) : [];
+      const moodsFor = cfg.bonds ? [...new Set([...batch.filter(b => b.entry.role === 'assistant').flatMap(b => b.speakers.map(canonical)), ...fresh.flatMap(e => e.who)])].filter(isPerson).slice(0, MAX_MOODS_PER_BATCH) : [];
+      const closes = cfg.bonds ? closeCandidates(fresh) : [];
+      Object.assign(qb, bondQuestions(bondPairList, moodsFor, closes));
       if (Object.keys(qb).length) {
         try {
           const B = (await callJev(job.context, qb, cfg)).answers;
@@ -1606,6 +1623,7 @@
               e.who = [a, ...e.who.filter(w => w !== a)].slice(0, 4); // 남 얘기면 그 사람 밑으로
             }
           });
+          applyBonds(bondPairList, moodsFor, closes, B, fresh);
         } catch (error) {
           setError('메모 정리', error); // 실패해도 메모는 원문 그대로 남는다
         }
@@ -1891,6 +1909,269 @@
     [/작년|지난\s*해|일\s*년\s*전|last\s+year|a\s+year\s+ago/iu, 300, 430],
   ];
 
+  // ══════════════════════════════════════════════════════════════════════
+  //  관계 · 지금 상태 (Jev 고르기 + 정규식만으로)
+  //   호칭·말투  대사 줄에서 정규식으로 (무료)
+  //   감정 변화  상호작용한 짝마다 방향별 Jev 선택 1문항 → 호감·신뢰를 ±1씩만 (튀지 않게)
+  //   관계 종류  처음이거나 변화가 쌓였을 때만 Jev 선택
+  //   기분      이번에 나온 인물마다 Jev 선택 (화면 · 자리 비운 인물 안내용)
+  //   약속·계획  새 메모가 이루거나 끝내면 Jev noul로 닫는다 (끝난 약속을 계속 넣지 않게)
+  // ══════════════════════════════════════════════════════════════════════
+
+  const BOND_TYPES = {
+    stranger: 'strangers, just met',
+    acquaintance: 'acquaintances',
+    friend: 'friends',
+    close: 'close friends',
+    family: 'family or relatives',
+    romance: 'crush or flirting, not yet lovers',
+    lover: 'lovers or partners',
+    mentor: 'mentor and student, senior and junior',
+    work: 'colleagues, boss and subordinate, allies on a task',
+    rival: 'rivals or competitors',
+    enemy: 'enemies, openly hostile',
+    master: 'master and servant, or captor and captive',
+  };
+  const BOND_LABEL = { stranger: '처음 보는 사이', acquaintance: '아는 사이', friend: '친구', close: '절친', family: '가족', romance: '썸', lover: '연인', mentor: '선후배·스승', work: '동료', rival: '라이벌', enemy: '적', master: '주종' };
+  const SHIFTS = {
+    same: 'no clear change',
+    warmer: 'A grew fonder of, closer to, or more grateful to B',
+    colder: 'A got hurt by, angry at, or distant from B',
+    trust_up: 'A came to trust or rely on B more',
+    trust_down: 'A came to doubt, suspect, or fear B',
+  };
+  const MOODS = {
+    calm: 'calm or neutral', happy: 'happy or cheerful', excited: 'excited or playful', affectionate: 'affectionate or loving',
+    shy: 'embarrassed or shy', anxious: 'anxious or scared', sad: 'sad or lonely', angry: 'angry',
+    annoyed: 'annoyed or sulky', tired: 'tired, hurt, or unwell', serious: 'serious or determined',
+  };
+  const MOOD_LABEL = { calm: '평온', happy: '기쁨', excited: '들뜸', affectionate: '애정', shy: '부끄러움', anxious: '불안', sad: '슬픔', angry: '분노', annoyed: '짜증', tired: '지침', serious: '진지' };
+  const MOOD_EMOJI = { calm: '😐', happy: '😊', excited: '😆', affectionate: '🥰', shy: '😳', anxious: '😰', sad: '😢', angry: '😠', annoyed: '😒', tired: '😩', serious: '🧐' };
+  const AXIS_MAX = 5;
+  const MAX_PAIRS_PER_BATCH = 3;
+  const MAX_MOODS_PER_BATCH = 4;
+  const MAX_CLOSE_PER_BATCH = 4;
+  const TYPE_RECHECK = 6;   // 감정 판정이 이만큼 쌓일 때마다 관계 종류를 다시 묻는다
+  const MOOD_FRESH_TURNS = 30;
+
+  const bondKey = (a, b) => `${a}→${b}`;
+  const isPerson = (n) => !!n && state.dict.e[n]?.type === 'person' && !state.dict.e[n].alias;
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const aliasesOf = (n) => Object.entries(state.dict.e).filter(([, x]) => x.alias === n).map(([k]) => k);
+
+  function bondOf(a, b, create = true) {
+    state.bonds ??= {};
+    const k = bondKey(a, b);
+    if (!state.bonds[k] && create) state.bonds[k] = { a, b, type: null, aff: 0, trust: 0, n: 0, term: null, polite: null, first: null, last: null, hist: [], pin: false };
+    return state.bonds[k] ?? null;
+  }
+  function personNow(n) {
+    state.people ??= {};
+    return (state.people[n] ??= { where: null, seen: null, turn: 0, mood: null, moodTurn: 0 });
+  }
+  function bondHistory(bond, what, ev = null) {
+    bond.hist.push({ when: nowWhen(), what, ev: ev?.id ?? null });
+    if (bond.hist.length > 12) bond.hist.splice(0, bond.hist.length - 12);
+  }
+
+  // 말투: 대사의 마지막 문장 끝으로 존댓말·반말
+  const POLITE_END = /(요|니다|니까|세요|십시오|죠|시죠|셔요|소서)[\s.!?~…♡♥"'”」』)]*$/u;
+  const CASUAL_END = /(야|어|아|워|와|봐|줘|돼|져|지|냐|니|자|해|래|게|네|군|걸|거든|잖아|다|라|까)[\s.!?~…♡♥"'”」』)]*$/u;
+  function speechLevel(quote) {
+    const last = quote.trim().split(/(?<=[.!?…~])\s+/).filter(Boolean).pop() ?? '';
+    if (POLITE_END.test(last)) return 'polite';
+    if (CASUAL_END.test(last)) return 'casual';
+    return null;
+  }
+  // 호칭: 이름(+호칭) 바로 뒤에 쉼표·느낌표·물음표가 오면 부른 말. "맛보돈 씨," "보민아!" "어디 가, 하윤?"
+  const TITLE_RE = '(?:선배님|선배|선생님|오빠|언니|누나|형님|형|쌤|님|씨|군|양|아|야)';
+  const BARE_TITLE = /^[\s"“'‘(]*(선배님|선배|선생님|오빠|언니|누나|형님|형|쌤|주인님|아가씨|도련님|당신|자기야|자기|[가-힣]{1,5}님)(?=[,，!?！？~…\s])/u; // "회장님," "사장님!" 도
+  function addressTerms(quote, others) {
+    const out = [];
+    for (const n of others) {
+      for (const nm of [n, ...aliasesOf(n)]) {
+        const m = new RegExp(`(?:^|[\\s"“'‘(,])(${escRe(nm)}\\s?${TITLE_RE}?)(?=[,，!?！？~…]|\\s*$)`, 'u').exec(quote);
+        if (m) { out.push({ to: n, term: m[1].trim() }); break; }
+      }
+    }
+    if (!out.length && others.length === 1) {
+      const m = BARE_TITLE.exec(quote);
+      if (m) out.push({ to: others[0], term: m[1] });
+    }
+    return out;
+  }
+
+  /** 배치의 대사 줄에서 호칭·말투, 나온 인물의 마지막 위치를 기록한다(무료). 많이 주고받은 짝을 돌려준다. */
+  function trackSpeech(batch) {
+    const touched = new Map();
+    const persona = personaCache && isPerson(canonical(personaCache)) ? canonical(personaCache) : null;
+    for (const b of batch) {
+      const text = cleanText(stripMeta(b.entry.text));
+      const present = new Set(findEntities(text).person.filter(isPerson));
+      const said = (a, quote) => {
+        present.add(a);
+        let others = [...new Set([...present, ...(state.scene?.cast ?? [])])].filter(n => n !== a && isPerson(n));
+        // 1:1 롤플: 캐릭터 곁에 아무도 없으면 유저에게 하는 말로 본다
+        if (!others.length && persona && a !== persona) others = [persona];
+        const level = speechLevel(quote);
+        const terms = addressTerms(quote, others);
+        const targets = terms.length ? terms : others.length === 1 ? [{ to: others[0], term: null }] : [];
+        for (const { to, term } of targets) {
+          const bond = bondOf(a, to);
+          if (term && bond.term !== term) { if (bond.term) bondHistory(bond, `호칭 "${bond.term}" → "${term}"`); bond.term = term; }
+          if (level && bond.polite !== level) { if (bond.polite) bondHistory(bond, level === 'polite' ? '반말 → 존댓말' : '존댓말 → 반말'); bond.polite = level; }
+          bond.first ??= { when: b.when ?? nowWhen(), place: b.place ?? null };
+          bond.last = b.when ?? nowWhen();
+          const k = [a, to].sort().join('|');
+          touched.set(k, (touched.get(k) ?? 0) + 2);
+        }
+      };
+      let spoke = false;
+      for (const line of text.split('\n')) {
+        const sp = parseSpeakerLine(line);
+        if (!sp || !isPerson(canonical(sp.name))) continue;
+        spoke = true;
+        said(canonical(sp.name), stripQuotes(sp.quote));
+      }
+      // 유저 메시지의 따옴표 대사는 유저 캐릭터(페르소나)의 말
+      if (!spoke && b.entry.role === 'user' && persona) {
+        for (const m of text.matchAll(/["“]([^"”\n]{2,300})["”]/g)) said(persona, m[1]);
+      }
+      for (const n of present) { const p = personNow(n); p.where = b.place ?? p.where; p.seen = b.when ?? p.seen; p.turn = state.turn; }
+    }
+    return touched;
+  }
+
+  /** 이번 배치에서 실제로 엮인 짝(대사 주고받기 + 두 사람이 함께 나온 메모) */
+  function interactionPairs(fresh, touched) {
+    const score = new Map(touched);
+    for (const e of fresh) {
+      if (e.kind === 'outfit' || e.kind === 'look' || e.kind === 'world') continue;
+      const ps = [...new Set(e.who.filter(isPerson))];
+      const sp = /^([^:"“]{1,15}):\s/.exec(e.t)?.[1];
+      if (sp && isPerson(canonical(sp)) && !ps.includes(canonical(sp))) ps.unshift(canonical(sp));
+      const top = ps.slice(0, 3);
+      for (let i = 0; i < top.length; i++) for (let j = i + 1; j < top.length; j++) {
+        const k = [top[i], top[j]].sort().join('|');
+        score.set(k, (score.get(k) ?? 0) + (e.kind === 'relation' ? 3 : 1) + e.imp);
+      }
+    }
+    return [...score.entries()].sort((x, y) => y[1] - x[1]).slice(0, MAX_PAIRS_PER_BATCH).map(([k]) => k.split('|'));
+  }
+
+  // 진행 중인 약속·계획: 계획 형식이거나, 약속 종류인데 "한 일"이 아닌 것. 과거·닫힘·지난 기억은 뺀다.
+  const isThread = (e) => isActive(e) && !e.closed && e.tense !== 'past' && (e.form === 'plan' || (e.kind === 'promise' && e.form !== 'did'));
+
+  /** 새 메모가 끝냈을 수 있는 진행 중인 약속·계획 (같은 사람이 나오고 내용이 가까운 것) */
+  function closeCandidates(fresh) {
+    const open = state.events.filter(isThread);
+    const out = [];
+    for (const neu of fresh) {
+      if (neu.form === 'plan' || neu.tense === 'future' || out.length >= MAX_CLOSE_PER_BATCH) continue; // 새 계획은 닫는 쪽이 아니다
+      const g = gramsOf(neu);
+      const nv = vecOf(neu);
+      const best = open.filter(o => o.id < neu.id && o.who.some(w => neu.who.includes(w)))
+        .map(o => { const ov = vecOf(o); return { o, s: Math.max(dice(g, gramsOf(o)), nv && ov ? dot(nv, ov) - 0.4 : 0) }; })
+        .filter(x => x.s >= 0.15).sort((a, b) => b.s - a.s).slice(0, 2); // 한 사건이 약속 둘을 함께 끝낼 수도 있다
+      for (const x of best) if (out.length < MAX_CLOSE_PER_BATCH && !out.some(c => c.old === x.o)) out.push({ neu, old: x.o });
+    }
+    return out;
+  }
+
+  /** 저장 2단계(Jev B)에 붙일 질문: 감정 변화(y) · 관계 종류(g) · 기분(h) · 약속 닫기(l) */
+  function bondQuestions(pairs, moodsFor, closes) {
+    const q = {};
+    pairs.forEach(([a, b], i) => {
+      for (const [x, y, d] of [[a, b, 'f'], [b, a, 'r']]) {
+        if (state.bonds?.[bondKey(x, y)]?.pin) continue;
+        q[`y${i}${d}`] = { type: 'choice', instructions: `In this part, how did ${x}'s feelings toward ${y} change? (A = ${x}, B = ${y})`, criteria: SHIFTS };
+      }
+      const ab = state.bonds?.[bondKey(a, b)];
+      const ba = state.bonds?.[bondKey(b, a)];
+      if (!(ab?.pin && ba?.pin) && (!ab?.type || (ab.n ?? 0) % TYPE_RECHECK === TYPE_RECHECK - 1)) {
+        q[`g${i}`] = { type: 'choice', instructions: `What is the relationship between ${a} and ${b} now?`, criteria: BOND_TYPES };
+      }
+    });
+    moodsFor.forEach((n, i) => { q[`h${i}`] = { type: 'choice', instructions: `How does ${n} feel at the end of this part?`, criteria: MOODS }; });
+    closes.forEach((p, i) => { q[`l${i}`] = { type: 'noul', instructions: `Does NEW fulfill, cancel, or end the plan or promise in OLD?\nOLD: «${p.old.t}»\nNEW: «${p.neu.t}»` }; });
+    return q;
+  }
+
+  function applyBonds(pairs, moodsFor, closes, B, fresh) {
+    const evidence = (a, b) => fresh.find(e => e.who.includes(a) && e.who.includes(b)) ?? null;
+    pairs.forEach(([a, b], i) => {
+      for (const [x, y, d] of [[a, b, 'f'], [b, a, 'r']]) {
+        const ans = B[`y${i}${d}`];
+        if (!ans) continue;
+        const bond = bondOf(x, y);
+        bond.n = (bond.n ?? 0) + 1;
+        bond.last = nowWhen();
+        bond.first ??= { when: nowWhen(), place: state.clock.place ?? null };
+        const p = choiceProbs(ans, Object.keys(SHIFTS));
+        const s = argmax(p);
+        if (!s || s === 'same' || p[s] < 0.5 || p.same >= 0.4) continue;
+        const before = { aff: bond.aff, trust: bond.trust };
+        // 호감 축과 신뢰 축은 따로: 배신처럼 "멀어짐 + 의심"이 함께면 둘 다 움직인다(두 번째도 확률이 충분할 때만)
+        const affS = p.warmer >= p.colder ? 'warmer' : 'colder';
+        const trS = p.trust_up >= p.trust_down ? 'trust_up' : 'trust_down';
+        if (affS === s || p[affS] >= 0.3) bond.aff = Math.max(-AXIS_MAX, Math.min(AXIS_MAX, bond.aff + (affS === 'warmer' ? 1 : -1)));
+        if (trS === s || p[trS] >= 0.3) bond.trust = Math.max(-AXIS_MAX, Math.min(AXIS_MAX, bond.trust + (trS === 'trust_up' ? 1 : -1)));
+        for (const ax of ['aff', 'trust']) {
+          // 큰 고개(±3)를 넘을 때만 이력에 남긴다
+          if (Math.abs(bond[ax]) >= 3 && Math.abs(before[ax]) < 3) bondHistory(bond, `${ax === 'aff' ? '호감' : '신뢰'} ${bond[ax] > 0 ? '+' : ''}${bond[ax]}`, evidence(x, y));
+        }
+      }
+      const t = B[`g${i}`];
+      if (!t) return;
+      const p = choiceProbs(t, Object.keys(BOND_TYPES));
+      const ty = argmax(p);
+      if (!ty || p[ty] < 0.55) return;
+      for (const [x, y] of [[a, b], [b, a]]) {
+        const bond = bondOf(x, y);
+        if (bond.pin || bond.type === ty) continue;
+        if (bond.type) bondHistory(bond, `${BOND_LABEL[bond.type]} → ${BOND_LABEL[ty]}`, evidence(x, y));
+        bond.type = ty;
+      }
+    });
+    moodsFor.forEach((n, i) => {
+      const p = choiceProbs(B[`h${i}`], Object.keys(MOODS));
+      const m = argmax(p);
+      if (m && p[m] >= 0.45) { const pn = personNow(n); pn.mood = m; pn.moodTurn = state.turn; }
+    });
+    closes.forEach((c, i) => {
+      if (!c.old.closed && noulProb(B[`l${i}`]) >= 0.6) c.old.closed = { by: c.neu.id, at: Date.now(), when: c.neu.when ?? null };
+    });
+  }
+
+  /** 주입용: 이 사람이 지금 장면 사람들을 어떻게 대하는지. 값이 없는 칸은 뺀다. */
+  function bondPhrase(bond) {
+    const bits = [];
+    if (bond.type) bits.push(bond.type);
+    if (bond.aff) bits.push(`aff ${bond.aff > 0 ? '+' : ''}${bond.aff}`);
+    if (bond.trust) bits.push(`trust ${bond.trust > 0 ? '+' : ''}${bond.trust}`);
+    if (bond.term) bits.push(`calls "${bond.term}"`);
+    if (bond.polite) bits.push(bond.polite);
+    return bits.length ? `→${bond.b}: ${bits.join(', ')}` : '';
+  }
+
+  /** 인물 머리줄: 관계(지금 장면 사람에게) + 자리에 없으면 마지막으로 본 때·곳·기분 */
+  function personHeader(name, featured, present) {
+    const parts = [];
+    if (!present.has(name)) {
+      const p = state.people?.[name];
+      if (p?.seen || p?.where) {
+        const seen = [whenTag(p.seen), p.where].filter(Boolean).join(' at ');
+        const mood = p.mood && state.turn - (p.moodTurn ?? 0) <= MOOD_FRESH_TURNS ? `, was ${p.mood}` : '';
+        parts.push(`away (last seen ${seen || 'earlier'}${mood})`);
+      }
+    }
+    const bonds = Object.values(state.bonds ?? {}).filter(bd => bd.a === name && featured.has(bd.b) && bd.b !== name);
+    const ranked = bonds.map(bd => ({ bd, w: (bd.type ? 2 : 0) + Math.abs(bd.aff) + Math.abs(bd.trust) + (bd.term ? 1 : 0) }))
+      .filter(x => x.w > 0).sort((a, b) => b.w - a.w).slice(0, 3);
+    for (const { bd } of ranked) { const s = bondPhrase(bd); if (s) parts.push(s); }
+    return parts.join(' · ');
+  }
+
   function readScene(entries, cfg) {
     const recent = entries.slice(-QUERY_MESSAGES);
     const queryText = recent.map(e => cleanText(e.text)).join('\n');
@@ -2005,12 +2286,12 @@
       const sem = qv && ev ? Math.max(0, dot(qv, ev)) : 0;
       const lex = lexOf(gramsOf(e));
       const ent = (e.who.some(w => named.has(w)) ? 1 : 0) * 0.6 + (e.place && placeSet.has(e.place) ? 0.4 : 0) + (e.who.some(w => asked.has(w)) ? 0.5 : 0);
-      const base = (ev && qv ? sem * 0.5 + lex * 0.15 : lex * 0.5) + ent * 0.2 + e.imp * 0.1 + (chosenIds.has(e.arc) ? 0.1 : 0);
+      const base = (ev && qv ? sem * 0.5 + lex * 0.15 : lex * 0.5) + ent * 0.2 + e.imp * 0.1 + (chosenIds.has(e.arc) ? 0.15 : 0);
       return { e, s: base + (e.pin ? 5 : 0) + (coreOfCast(e) ? 0.15 : 0) + (inRange(e) ? 0.3 : 0) + (sc.firstMeet ? (1 - e.id / (state.seq || 1)) * 0.2 : 0), sem, lex };
     });
     // 고른 대단원 안의 것 + (어느 대단원이든) 고정·등장인물 핵심·날짜 범위
-    const inChosen = scored.filter(x => chosenIds.has(x.e.arc) || x.e.pin || coreOfCast(x.e) || inRange(x.e));
-    const cands = (inChosen.length >= Math.min(8, scored.length) ? inChosen : scored).sort((x, y) => y.s - x.s).slice(0, cfg.candidates);
+    // 대단원은 문이 아니라 가산점: 다른 단원의 메모도 점수가 높으면 후보가 된다(고른 단원이 틀려도 막히지 않게)
+    const cands = scored.sort((x, y) => y.s - x.s).slice(0, cfg.candidates);
 
     // ── Jev 1회: 대단원 고르기 + 메모 필요? ──
     const cacheKey = hashText(queryState + '|' + cands.map(x => x.e.id).join(',') + '|' + chosenArcs.map(x => x.a.id).join(','));
@@ -2088,6 +2369,17 @@
       budget -= cost;
       picks.push({ e: o, s: 1, pm: null, p: 1, forced: true });
     }
+    // 지금 장면(또는 최신 메시지)에 나온 사람의 진행 중인 약속·계획은 넣는다. 캐릭터가 약속을 잊지 않게.
+    if (cfg.bonds) {
+      const who = new Set([...sc.cast, ...findEntities(sc.focusText).person]);
+      const threads = pool.filter(e => isThread(e) && e.who.some(w => who.has(w)) && !picks.some(x => x.e === e)).sort((a, b) => b.id - a.id).slice(0, 2);
+      for (const t of threads) {
+        const cost = estimateTokens(lineText(t, cfg)) + 6;
+        if (cost > budget) continue;
+        budget -= cost;
+        picks.push({ e: t, s: 1, pm: null, p: 1, forced: true });
+      }
+    }
     picks.sort((a, b) => a.e.id - b.e.id);
     const pickIds = new Set(picks.map(x => x.e.id));
     trace.arcs = arcScores.slice(0, 6).map(x => ({ id: x.a.id, title: arcTitle(x.a), s: round2(x.s), chosen: chosenIds.has(x.a.id), p: trace.arcP?.[x.a.id] != null ? round2(trace.arcP[x.a.id]) : null }));
@@ -2125,7 +2417,18 @@
     const arcLine = arc && (arc.kw.length || arc.cast.length)
       ? `<current chapter> ${arc.title || `#${state.arcs.indexOf(arc) + 1}`}${whenTag(arc.from) ? ` · from ${whenTag(arc.from)}` : ''}${arc.places.length ? ` · ${arc.places.slice(0, 2).join(', ')}` : ''}${arc.kw.length ? ` · ${arc.kw.slice(0, 6).join(', ')}` : ''}`
       : '';
-    if (!picks.length && !arcLine) return '';
+    const prevArcs = state.arcs.filter(a => a !== arc && (!arc || a.id < arc.id) && (a.kw.length || a.cast.length)).slice(-2);
+    const prevLine = arcLine && prevArcs.length
+      ? ` · before: ${prevArcs.map(a => `${a.title || `#${state.arcs.indexOf(a) + 1}`} ${[whenTag(a.from), whenTag(a.to)].filter(Boolean).filter((v, i, x) => x.indexOf(v) === i).join('–')} ${[...a.places.slice(0, 1), ...a.kw.slice(0, 3)].join(', ')}`.replace(/\s+/g, ' ').trim()).join(' | ')}`
+      : '';
+    // 지금 장면 사람 + 최신 메시지에서 물은 사람 (+ 유저 캐릭터): 이 사람들끼리의 관계만 한 줄씩
+    const userName = personaCache && isPerson(canonical(personaCache)) ? canonical(personaCache) : null;
+    const present = new Set([...(sc?.cast ?? []), ...(userName ? [userName] : [])].filter(isPerson)); // 유저는 늘 장면에 있다
+    const asked = new Set(sc?.focusText ? findEntities(sc.focusText).person.filter(isPerson) : []);
+    const featured = new Set([...present, ...asked, ...(personaCache && isPerson(canonical(personaCache)) ? [canonical(personaCache)] : [])]);
+    const headers = new Map();
+    if (cfg.bonds) for (const n of featured) { const h = personHeader(n, featured, present); if (h) headers.set(n, h); }
+    if (!picks.length && !arcLine && !headers.size) return '';
     const label = cfg.injectLabel;
     const line = (e, group) => {
       const w = cfg.showStoryTime ? whenTag(e.when) : '';
@@ -2138,7 +2441,9 @@
       const tags = [];
       if (e.r === 'u') tags.push('user');
       if (e.form && FORM_TAG[e.form]) tags.push(FORM_TAG[e.form]);
-      if (e.old || e.tense === 'past') tags.push('past');
+      if (e.closed) tags.push('done');
+      else if (isThread(e) && cfg.bonds) tags.push('open');
+      else if (e.old || e.tense === 'past') tags.push('past');
       else if (e.tense === 'future') tags.push('planned');
       else if (e.tense === 'current' && (e.form === 'state' || e.form === 'rule' || e.form === 'plan')) tags.push('current');
       // 앞 문장은 메모에 이름(인물·장소·물건)이 하나도 없어서 무엇에 관한 말인지 모를 때만 붙인다
@@ -2153,12 +2458,13 @@
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(e);
     }
+    for (const n of headers.keys()) if (!groups.has(n)) groups.set(n, []);
     const cast = new Set(sc?.cast ?? []);
     const order = [...groups.keys()].sort((a, b) => (a === WORLD) - (b === WORLD) || (a === '기타') - (b === '기타') || cast.has(b) - cast.has(a));
     const groupName = (k) => (k === WORLD ? 'World' : k === '기타' ? 'Other' : k);
-    const body = order.map(k => `<${groupName(k)}>\n${groups.get(k).map(e => line(e, k)).join('\n')}`).join('\n');
+    const body = order.map(k => [`<${groupName(k)}>${headers.has(k) ? ` ${headers.get(k)}` : ''}`, ...groups.get(k).map(e => line(e, k))].join('\n')).join('\n');
     const note = cfg.note && cfg.translate !== 'off' ? `${cfg.note} Names may be romanized.` : cfg.note;
-    return [`[${label}]`, note, arcLine, body, `[/${label}]`].filter(Boolean).join('\n');
+    return [`[${label}]`, note, arcLine + prevLine, body, `[/${label}]`].filter(Boolean).join('\n');
   }
 
   // 메모 줄만 영어로. 같은 줄은 이번 실행 동안만 기억해 두고 다시 번역하지 않는다(저장하지 않음).
@@ -2390,7 +2696,7 @@
   //  화면
   // ══════════════════════════════════════════════════════════════════════
 
-  const ui = { tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
+  const ui = { relFocus: null, tab: 'home', bound: false, draft: null, wiz: null, test: {}, query: '', who: '', openArcs: new Set(), showOrig: new Set(), editing: null, dry: null, progress: '' };
 
   const CSS = `
     :root{--a:#5b7cfa;--ok:#3fae7a;--warn:#e0a03a;--bad:#e0605a}
@@ -2435,6 +2741,25 @@
     .opt.on{border-color:var(--a);background:rgba(91,124,250,.1)}
     .opt b{display:block}
     .badge{display:inline-block;border-radius:5px;padding:0 6px;font-size:11px;font-weight:600;background:rgba(91,124,250,.18);color:#9fb3ff;margin-left:4px;vertical-align:1px}
+    .relmap svg{display:block;max-width:420px;margin:0 auto}
+    .relmap .node{fill:var(--darkbg,#1b1c22);stroke:#8d909a;stroke-width:1.5}
+    .relmap .node.on{stroke:#9f7cf2;stroke-width:3}
+    .relmap .nlab{fill:var(--textcolor,#e6e6ea);font-size:11px;text-anchor:middle;pointer-events:none}
+    .relmap .elab{fill:var(--textcolor2,#c3c5cc);font-size:10px;text-anchor:middle;pointer-events:none;paint-order:stroke;stroke:var(--darkbg,#1b1c22);stroke-width:4px;stroke-linejoin:round}
+    .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+    .legend i{display:inline-block;width:12px;height:4px;border-radius:2px;margin-right:4px;vertical-align:middle}
+    .bond .dir{margin-top:8px;padding-top:8px;border-top:1px dashed var(--borderc,#2c2e36)}
+    .bond .axes{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px}
+    .bond .ax{display:inline-flex;align-items:center;gap:4px}
+    .bond.pinned{border-color:#9f7cf2}
+    .btn.ic{min-width:34px;min-height:34px;padding:2px 8px}
+    .gauge{position:relative;display:inline-block;width:76px;height:8px;border-radius:4px;background:rgba(139,141,151,.2);overflow:hidden}
+    .gauge::after{content:'';position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.35)}
+    .gauge .pos{position:absolute;left:50%;top:0;bottom:0;background:#e8739d}
+    .gauge.t .pos{background:#5fc28f}
+    .gauge .neg{position:absolute;right:50%;top:0;bottom:0;background:#6b9be8}
+    .gv{min-width:24px;text-align:right;font-size:12px}
+    .hist{padding:3px 0}
     .chip{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;border:1px solid var(--borderc,#383b46);margin:2px 3px 2px 0;cursor:pointer;background:none}
     .chip.k{background:rgba(160,120,240,.15);color:#c6adff;border-color:transparent;cursor:default}
     .chip.t{background:rgba(139,141,151,.14);color:var(--textcolor2,#a6a9b3);border-color:transparent;cursor:default}
@@ -2495,12 +2820,12 @@
     const body = document.getElementById('bd');
     const keepScroll = body && body.dataset.tab === (ui.wiz ? 'wiz' : ui.tab);
     const scroll = body ? body.scrollTop : 0;
-    const tabs = [['home', '🏠 홈'], ['timeline', '📚 타임라인'], ['people', '👥 인물'], ['trace', '🔍 회상 기록'], ['settings', '⚙️ 설정'], ['tools', '🧰 도구']];
+    const tabs = [['home', '🏠 홈'], ['timeline', '📚 타임라인'], ['people', '👥 인물'], ['bonds', '💞 관계'], ['trace', '🔍 회상 기록'], ['settings', '⚙️ 설정'], ['tools', '🧰 도구']];
     document.body.innerHTML = `<style>${CSS}</style>
       <div class="w">
         <div class="hd"><b>🧠 JevHypa</b><span class="sub">${escapeHtml([chatLabel.char, chatLabel.chat].filter(Boolean).join(' · ') || '채팅방을 열면 기억이 보여요')}</span><button class="x" data-act="close" title="닫기">✕</button></div>
         ${ui.wiz ? '' : `<div class="tabs">${tabs.map(([id, l]) => `<button class="tab${ui.tab === id ? ' on' : ''}" data-act="tab" data-tab="${id}">${l}</button>`).join('')}</div>`}
-        <div class="bd" id="bd" data-tab="${ui.wiz ? 'wiz' : ui.tab}"><div class="in">${ui.wiz ? renderWizard() : ({ home: renderHome, timeline: renderTimeline, people: renderPeople, trace: renderTrace, settings: renderSettings, tools: renderTools }[ui.tab] ?? renderHome)()}</div></div>
+        <div class="bd" id="bd" data-tab="${ui.wiz ? 'wiz' : ui.tab}"><div class="in">${ui.wiz ? renderWizard() : ({ home: renderHome, timeline: renderTimeline, people: renderPeople, bonds: renderBonds, trace: renderTrace, settings: renderSettings, tools: renderTools }[ui.tab] ?? renderHome)()}</div></div>
       </div>
       ${ui.editing ? renderEditor() : ''}`;
     const nb = document.getElementById('bd');
@@ -2693,7 +3018,7 @@
       ${ui.progress ? `<div class="card small">${escapeHtml(ui.progress)}</div>` : ''}
       <div class="sec">지금</div>
       <div class="card">
-        <div class="row">${when ? `<span>🕒 ${escapeHtml(when)}</span>` : ''}${sc?.place ? `<span>📍 ${escapeHtml(sc.place)}</span>` : ''}${(sc?.cast ?? []).map(n => `<button class="chip" data-act="who" data-who="${escapeHtml(n)}">${escapeHtml(n)}</button>`).join('')}</div>
+        <div class="row">${when ? `<span>🕒 ${escapeHtml(when)}</span>` : ''}${sc?.place ? `<span>📍 ${escapeHtml(sc.place)}</span>` : ''}${(sc?.cast ?? []).map(n => `<button class="chip" data-act="who" data-who="${escapeHtml(n)}" title="${escapeHtml(MOOD_LABEL[state.people?.[n]?.mood] ?? '')}">${MOOD_EMOJI[state.people?.[n]?.mood] ? `${MOOD_EMOJI[state.people[n].mood]} ` : ''}${escapeHtml(n)}</button>`).join('')}</div>
         ${arc ? `<div style="margin-top:8px"><b>${escapeHtml(arcTitle(arc))}</b> <span class="small muted">· 장면 ${arc.sceneIds.length}개</span><div>${arc.kw.map(k => `<span class="chip t">${escapeHtml(k)}</span>`).join('')}</div></div>` : '<div class="small muted">아직 대단원이 없어요. 대화가 쌓이면 생겨요.</div>'}
       </div>
       <div class="sec">마지막 회상 ${last ? `<span class="small" style="font-weight:400">· ${timeAgo(last.at)} · ${last.ms}ms</span>` : ''}</div>
@@ -2819,6 +3144,114 @@
 
   // ── 회상 기록 ──
 
+  // ── 관계 ──
+  //  위: 관계도(사람 = 점, 관계 = 선. 분홍 = 호감, 파랑 = 반감, 굵기 = 세기). 점을 누르면 그 사람 관계만.
+  //  아래: 짝마다 카드. 양쪽 방향의 호감·신뢰를 −/+로 바로 고치고, 📌로 자동 변경을 잠근다.
+
+  function bondPairs() {
+    const pairs = new Map();
+    for (const bd of Object.values(state.bonds ?? {})) {
+      if (!isPerson(bd.a) || !isPerson(bd.b) || bd.a === bd.b) continue;
+      const [x, y] = [bd.a, bd.b].sort();
+      const k = `${x}|${y}`;
+      const p = pairs.get(k) ?? { a: x, b: y, ab: null, ba: null };
+      if (bd.a === x) p.ab = bd; else p.ba = bd;
+      pairs.set(k, p);
+    }
+    return [...pairs.values()].map(p => ({
+      ...p,
+      w: Math.abs(p.ab?.aff ?? 0) + Math.abs(p.ba?.aff ?? 0) + Math.abs(p.ab?.trust ?? 0) + Math.abs(p.ba?.trust ?? 0) + (p.ab?.n ?? 0) + (p.ba?.n ?? 0) + ((p.ab?.type || p.ba?.type) ? 3 : 0),
+    })).sort((x, y) => y.w - x.w);
+  }
+
+  function relMap(list, focus) {
+    const degree = new Map();
+    for (const p of list) for (const n of [p.a, p.b]) degree.set(n, (degree.get(n) ?? 0) + p.w + 1);
+    const nodes = [...degree.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([n]) => n);
+    if (nodes.length < 2) return '';
+    const W = 340, H = 250, cx = W / 2, cy = H / 2, r = Math.min(100, 40 + nodes.length * 9);
+    const pos = new Map(nodes.map((n, i) => {
+      const t = -Math.PI / 2 + (i / nodes.length) * Math.PI * 2;
+      return [n, [cx + r * Math.cos(t) * 1.25, cy + r * Math.sin(t)]];
+    }));
+    const edges = list.filter(p => pos.has(p.a) && pos.has(p.b)).map(p => {
+      const [x1, y1] = pos.get(p.a), [x2, y2] = pos.get(p.b);
+      const affs = [p.ab?.aff, p.ba?.aff].filter(v => v != null);
+      const aff = affs.length ? affs.reduce((s, v) => s + v, 0) / affs.length : 0;
+      const color = aff > 0.4 ? '#e8739d' : aff < -0.4 ? '#6b9be8' : '#8d909a';
+      const dim = focus && p.a !== focus && p.b !== focus ? ' opacity="0.15"' : '';
+      const type = p.ab?.type || p.ba?.type;
+      const label = type ? `<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 3}" class="elab"${dim}>${escapeHtml(BOND_LABEL[type])}</text>` : '';
+      return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${(1.5 + Math.abs(aff) * 0.8).toFixed(1)}"${type ? '' : ' stroke-dasharray="4 3"'} stroke-linecap="round"${dim}/>${label}`;
+    }).join('');
+    const dots = nodes.map(n => {
+      const [x, y] = pos.get(n);
+      const mood = MOOD_EMOJI[state.people?.[n]?.mood] ?? '';
+      const on = focus === n;
+      return `<g data-act="rel-focus" data-name="${escapeHtml(n)}" style="cursor:pointer"><circle cx="${x}" cy="${y}" r="20" class="node${on ? ' on' : ''}"/><text x="${x}" y="${y + 4}" class="nlab">${escapeHtml(clip(n, 4))}</text>${mood ? `<text x="${x + 15}" y="${y - 12}" font-size="12">${mood}</text>` : ''}</g>`;
+    }).join('');
+    return `<div class="card relmap"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="인물 관계도">${edges}${dots}</svg>
+      <div class="small muted legend"><span><i style="background:#e8739d"></i>호감</span><span><i style="background:#6b9be8"></i>반감</span><span><i style="background:#8d909a"></i>보통</span><span>점선 = 관계 종류 모름 · 굵을수록 강함</span></div></div>`;
+  }
+
+  function gauge(v, kind) {
+    const pct = Math.min(1, Math.abs(v) / AXIS_MAX) * 50;
+    return `<span class="gauge ${kind}"><span class="${v >= 0 ? 'pos' : 'neg'}" style="width:${pct}%"></span></span><span class="num gv">${v > 0 ? '+' : ''}${v}</span>`;
+  }
+
+  function dirRow(bd, a, b) {
+    const btn = (f, d, label) => `<button class="btn sm ic" data-act="bond-adj" data-a="${escapeHtml(a)}" data-b="${escapeHtml(b)}" data-f="${f}" data-d="${d}" aria-label="${a}→${b} ${f === 'aff' ? '호감' : '신뢰'} ${label}">${label}</button>`;
+    const x = bd ?? { aff: 0, trust: 0 };
+    const talk = [bd?.term ? `"${escapeHtml(bd.term)}"` : '', bd?.polite ? (bd.polite === 'polite' ? '존댓말' : '반말') : ''].filter(Boolean).join(' · ');
+    return `<div class="dir">
+      <div class="small"><b>${escapeHtml(a)}</b> → ${escapeHtml(b)}${talk ? ` <span class="muted">· ${talk}</span>` : ''}</div>
+      <div class="axes">
+        <span class="ax"><span class="small muted">호감</span>${btn('aff', -1, '−')}${gauge(x.aff, 'a')}${btn('aff', 1, '+')}</span>
+        <span class="ax"><span class="small muted">신뢰</span>${btn('trust', -1, '−')}${gauge(x.trust, 't')}${btn('trust', 1, '+')}</span>
+      </div>
+    </div>`;
+  }
+
+  function bondCard(p) {
+    const type = p.ab?.type || p.ba?.type || '';
+    const pin = !!(p.ab?.pin || p.ba?.pin);
+    const first = p.ab?.first ?? p.ba?.first;
+    const last = [p.ab?.last, p.ba?.last].filter(Boolean).sort((x, y) => (y.day ?? 0) - (x.day ?? 0))[0];
+    const hist = [...(p.ab?.hist ?? []).map(h => ({ ...h, d: `${p.a}→${p.b}` })), ...(p.ba?.hist ?? []).map(h => ({ ...h, d: `${p.b}→${p.a}` }))]
+      .sort((x, y) => (x.when?.day ?? 0) - (y.when?.day ?? 0));
+    const da = `data-a="${escapeHtml(p.a)}" data-b="${escapeHtml(p.b)}"`;
+    return `<div class="card bond${pin ? ' pinned' : ''}">
+      <div class="row" style="flex-wrap:nowrap">
+        <b style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0">${escapeHtml(p.a)} ⇄ ${escapeHtml(p.b)}</b>
+        <select class="sel sm" style="width:auto;flex:0 0 auto;max-width:150px" data-act="bond-type" ${da} aria-label="관계 종류">
+          <option value=""${type ? '' : ' selected'}>관계 모름</option>
+          ${Object.entries(BOND_LABEL).map(([k, v]) => `<option value="${k}"${type === k ? ' selected' : ''}>${v}</option>`).join('')}
+        </select>
+        <button class="btn sm ic${pin ? ' p' : ''}" data-act="bond-pin" ${da} title="${pin ? '자동 변경 잠금 풀기' : '자동으로 바뀌지 않게 잠그기'}" aria-label="잠금">${pin ? '🔒' : '🔓'}</button>
+      </div>
+      ${dirRow(p.ab, p.a, p.b)}${dirRow(p.ba, p.b, p.a)}
+      <div class="small muted" style="margin-top:6px">${first ? `처음: ${escapeHtml([formatWhen(first.when, true), first.place].filter(Boolean).join(' · ') || '기록 없음')}` : ''}${last ? ` · 최근: ${escapeHtml(formatWhen(last, true))}` : ''}</div>
+      ${hist.length ? `<details style="margin-top:6px"><summary class="small">변화 기록 ${hist.length}개</summary>${hist.map(h => `<div class="small hist"><span class="muted">${escapeHtml(formatWhen(h.when, true) || '')}</span> ${escapeHtml(h.d)} · ${escapeHtml(h.what)}${h.ev && eventById(h.ev) ? ` <span class="muted">— ${escapeHtml(clip(eventById(h.ev).c ?? eventById(h.ev).t, 60))}</span>` : ''}</div>`).join('')}</details>` : ''}
+      <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn sm d" data-act="bond-del" ${da}>관계 지우기</button></div>
+    </div>`;
+  }
+
+  function renderBonds() {
+    const list = bondPairs();
+    if (!list.length) {
+      return `<div class="card empty"><b>아직 관계 기록이 없어요</b>
+        <div class="small muted" style="margin-top:6px">대화가 정리될 때 누가 누구를 어떻게 부르는지(호칭·존댓말), 사이가 가까워졌는지 멀어졌는지를 자동으로 쌓아요.
+        인물 탭에 이름이 등록돼 있어야 해요. 설정의 <b>관계 추적</b>이 켜져 있는지도 확인하세요.</div></div>`;
+    }
+    const focus = ui.relFocus && list.some(p => p.a === ui.relFocus || p.b === ui.relFocus) ? ui.relFocus : null;
+    const shown = focus ? list.filter(p => p.a === focus || p.b === focus) : list;
+    return `${relMap(list, focus)}
+      <div class="row" style="margin:-4px 0 10px">${focus
+        ? `<span class="small"><b>${escapeHtml(focus)}</b>의 관계만 보는 중</span><button class="btn sm" data-act="rel-focus" data-name="">전체 보기</button>`
+        : '<span class="small muted">관계도의 이름을 누르면 그 사람 관계만 보여요. −/+로 바로 고칠 수 있어요.</span>'}</div>
+      ${shown.map(bondCard).join('')}`;
+  }
+
   function renderTrace() {
     const t = ui.dry ?? state.lastRecall;
     const dryForm = `<div class="card"><b>질문 넣어보기</b><div class="small muted" style="margin:2px 0 8px">이 말을 보내면 어떤 메모가 떠오르는지 미리 봐요. 실제로 보내지는 않아요. (Jev 1회 · 임베딩 1회 사용)</div>
@@ -2884,6 +3317,7 @@
         ${field('비우는 간격 (턴)', '', `<input class="inp" type="number" inputmode="numeric" min="10" max="10000" data-field="rejClearEvery" value="${escapeHtml(d.rejClearEvery)}">`)}
         ${field('메모 압축', '말버릇을 빼고, 메모가 처음 쓰일 때 Jev가 원문에서 필요한 단어만 골라 짧게 만들어요. 원문은 보관돼요.', sw('compress', d.compress))}
         ${field('카드로 정리', '메모마다 형식(말·규칙·소문…), 지금도 유효한지, 누구 얘기인지, 앞 문장을 Jev로 붙여요. 메모당 Jev 문항이 2~3개 늘어요.', sw('cards', d.cards))}
+        ${field('관계·기분 추적', '누가 누구를 어떻게 부르는지(호칭·존댓말), 사이가 가까워졌는지 멀어졌는지, 기분과 마지막 위치를 쌓아요. 관계 탭에서 보고 고칠 수 있고, 지금 장면 사람의 관계가 메모에 한 줄로 들어가요. 저장할 때 Jev 문항이 몇 개 늘어요.', sw('bonds', d.bonds))}
         ${field('바뀐 기억 정리', '새 메모가 옛 메모를 뒤집으면 옛 것을 "지난 기억"으로 내려요. 같은 말 반복도 걸러요.', sw('supersede', d.supersede))}
       </div>
       <div class="sec">주입</div><div class="card">
@@ -3052,6 +3486,20 @@
     }
     if (el.dataset?.field === 'translate') document.querySelectorAll('[data-tr]').forEach(r => { r.style.display = r.dataset.tr.split(' ').includes(el.value) ? '' : 'none'; });
     if (el.dataset?.field && ui.tab === 'settings' && !ui.wiz) { scheduleSettingsSave(); return; }
+    if (act === 'bond-type') {
+      const { a, b } = el.dataset;
+      const to = el.value || null;
+      for (const [x, y] of [[a, b], [b, a]]) {
+        const bd = bondOf(x, y);
+        if (bd.type === to) continue;
+        bondHistory(bd, `${BOND_LABEL[bd.type] ?? '모름'} → ${BOND_LABEL[to] ?? '모름'} (직접)`);
+        bd.type = to;
+      }
+      recallCache.clear();
+      await persist();
+      render();
+      return;
+    }
     if (act === 'who-select') { ui.who = el.value; render(); return; }
     if (act === 'ent-type') { const x = state.dict.e[el.dataset.name]; if (x) { x.type = el.value; matcherCache = null; await persist(); render(); } return; }
     if (act === 'ent-alias' && el.value) {
@@ -3210,12 +3658,38 @@
         return;
       }
       case 'ent-confirm': { const x = state.dict.e[el.dataset.name]; if (x) { x.src = 'manual'; x.n = Math.max(x.n, SPEAKER_ACTIVE_COUNT); retagAll(); await changed('인물로 등록했어요.'); } return; }
+      case 'rel-focus': ui.relFocus = el.dataset.name || null; render(); return;
+      case 'bond-adj': {
+        const { a, b, f } = el.dataset;
+        const bd = bondOf(a, b);
+        bd[f] = Math.max(-AXIS_MAX, Math.min(AXIS_MAX, (bd[f] ?? 0) + Number(el.dataset.d)));
+        await changed();
+        return;
+      }
+      case 'bond-pin': {
+        const { a, b } = el.dataset;
+        const on = !(state.bonds?.[bondKey(a, b)]?.pin || state.bonds?.[bondKey(b, a)]?.pin);
+        bondOf(a, b).pin = on;
+        bondOf(b, a).pin = on;
+        await changed(on ? '잠갔어요. 이 관계는 이제 자동으로 바뀌지 않아요.' : '잠금을 풀었어요.');
+        return;
+      }
+      case 'bond-del': {
+        const { a, b } = el.dataset;
+        if (!await confirmDialog(`${a} ⇄ ${b} 관계 기록을 지울까요?`, '지우기')) return;
+        delete state.bonds[bondKey(a, b)];
+        delete state.bonds[bondKey(b, a)];
+        await changed('지웠어요.');
+        return;
+      }
       case 'ent-del': {
         const name = el.dataset.name;
         delete state.dict.e[name];
         for (const [n, x] of Object.entries(state.dict.e)) if (x.alias === name) delete state.dict.e[n];
         rejSet.add(name);
         for (const x of state.events) x.who = x.who.filter(w => w !== name);
+        for (const [k, bd] of Object.entries(state.bonds ?? {})) if (bd.a === name || bd.b === name) delete state.bonds[k];
+        if (state.people) delete state.people[name];
         matcherCache = null;
         for (const a of state.arcs) refreshArc(a);
         await changed(`${name}을(를) 뺐어요.`);
@@ -3360,7 +3834,7 @@
 
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
-      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
+      analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
       ingest, recall, formatMemories, splitRaw, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
