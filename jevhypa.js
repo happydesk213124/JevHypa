@@ -94,7 +94,6 @@
   const MAX_STATE_CHARS = 9000;          // Jev는 state가 32KB를 넘으면 long-context 모드(느리고 부정확)
   const MAX_QUESTIONS = 120;
   const SETTLE = 2;                      // 최근 2개(리롤될 수 있는 것)는 저장하지 않는다
-  const SYNC_BATCHES = 2;
   const BACKGROUND_BATCHES = 4;
   const MAX_EVENTS = 3000;
   const MAX_SEEN = 8000;
@@ -112,11 +111,11 @@
   const MAX_COMPRESS_QUESTIONS = 70;
   const MAX_WORD_QUESTIONS = 20;
   const SPEAKER_ACTIVE_COUNT = 2;
-  const QUERY_MESSAGES = 6;
-  const SECOND_SEARCH = 6;
+  const QUERY_MESSAGES = 6;           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
+  const SECOND_SEARCH = 6;            // 빠진 근거를 찾을 때 더 볼 메모 수
   const BRIDGE_MAX_TOKENS = 400;      // "이 장면 흐름" 최대 토큰
-  const UNSENT_MAX_TOKENS = 1500;     // 아직 정리 못 한 이전 메시지 원문 최대 토큰            // 빠진 근거를 찾을 때 더 볼 메모 수
-  const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)           // 회상할 때 "지금 장면"으로 보는 최근 메시지 수
+  const INBOX_MAX = 200;             // 정리 대기 중인 메시지 최대 개수
+  const RECALL_STATE_CHARS = 6000;    // 회상 판정 때 Jev에 보내는 최근 대화 (최신 메시지가 끝에 온다)
 
   const KINDS = {
     profile: { label: '인물정보', desc: 'lasting fact about a character (identity, past, personality, job)' },
@@ -958,10 +957,13 @@
     return s;
   }
 
-  async function readChatIdentity() {
+  // 채팅 원본(getChatFromIndex)은 메시지 전체라 크다. 번호가 그대로면 다시 읽지 않는다.
+  let identityCache = null;
+  async function readChatIdentity({ full = false } = {}) {
     const charIndex = await R.getCurrentCharacterIndex();
     if (charIndex == null || charIndex < 0) return null;
     const chatIndex = await R.getCurrentChatIndex();
+    if (!full && identityCache && identityCache.charIndex === charIndex && identityCache.chatIndex === chatIndex) return { ...identityCache.id, cached: true };
     if (characterCache.index !== charIndex) {
       let character = null;
       try { character = R.getCharacterFromIndex ? await R.getCharacterFromIndex(charIndex) : await R.getCharacter(); } catch { }
@@ -974,7 +976,9 @@
     }
     let chat = null;
     try { chat = await R.getChatFromIndex(charIndex, chatIndex); } catch { }
-    return { key: `${characterCache.chaId}_${chat?.id || `idx${chatIndex}`}`, char: characterCache.name, chat: chat?.name ?? '', chatObj: chat };
+    const id = { key: `${characterCache.chaId}_${chat?.id || `idx${chatIndex}`}`, char: characterCache.name, chat: chat?.name ?? '' };
+    identityCache = { charIndex, chatIndex, id };
+    return { ...id, chatObj: chat };
   }
 
   async function personaName(chat) {
@@ -986,11 +990,12 @@
     } catch { return ''; }
   }
 
-  async function ensureChat() {
-    const id = await readChatIdentity();
+  /** full: 채팅 원본까지 새로 읽는다(채팅을 열 때 · 지금 전부 처리 · 화면을 열 때만). 요청 때는 번호만 확인한다. */
+  async function ensureChat({ full = false } = {}) {
+    const id = await readChatIdentity({ full });
     if (!id) return false;
     chatLabel = { char: id.char, chat: id.chat };
-    rawChatObj = id.chatObj;
+    if (!id.cached) rawChatObj = id.chatObj;
     if (id.key === chatKey) return true;
     chatKey = id.key;
     let loaded = null;
@@ -1256,7 +1261,7 @@
       if (m && m.removable === true && (m.role === 'user' || m.role === 'assistant')) {
         const text = contentOf(m);
         const hash = hashText(m.role + '\u0000' + text);
-        out.push({ index, role: m.role, text, hash, key: `h:${hash}` });
+        out.push({ index, role: m.role, text, hash, key: `h:${hash}`, loose: looseKey(m.role, text) });
       }
     });
     return out;
@@ -1280,32 +1285,31 @@
     const out = [];
     const fm = Number(chat.fmIndex ?? -1);
     const greet = fm >= 0 && characterCache.alternateGreetings?.[fm] != null ? characterCache.alternateGreetings[fm] : characterCache.firstMessage;
-    if (greet && String(greet).trim()) out.push({ key: GREETING_KEY, role: 'assistant', text: resolveNames(greet) });
+    if (greet && String(greet).trim()) out.push({ key: GREETING_KEY, role: 'assistant', text: resolveNames(greet), loose: looseKey('assistant', resolveNames(greet)) });
     chat.message.forEach((m, i) => {
       const text = String(m?.data ?? '');
       if (!text.trim()) return;
-      out.push({ key: m?.chatId ? `c:${m.chatId}` : `r:${i}:${hashText(text)}`, role: m?.role === 'user' ? 'user' : 'assistant', text: resolveNames(text) });
+      const role = m?.role === 'user' ? 'user' : 'assistant';
+      out.push({ key: m?.chatId ? `c:${m.chatId}` : `r:${i}:${hashText(text)}`, role, text: resolveNames(text), loose: looseKey(role, resolveNames(text)) });
     });
     return out;
   }
 
   /** 요청 속 메시지에 원본 키를 붙인다. 원본에만 있거나(숨김) 요청에만 있는(삽입) 메시지는 건너뛴다. */
-  function alignKeys(entries, raw) {
-    const sim = (a, b) => dice(bigrams(clip(cleanText(a), 400)), bigrams(clip(cleanText(b), 400)));
-    let i = entries.length - 1, j = raw.length - 1, skips = 0;
-    while (i >= 0 && j >= 0 && skips < 12) {
-      const e = entries[i], r = raw[j];
-      if (e.role === r.role && sim(e.text, r.text) >= 0.3) { e.key = r.key; i--; j--; continue; }
-      if (j > 0 && raw[j - 1].role === e.role && sim(e.text, raw[j - 1].text) >= 0.3) { j--; skips++; continue; }
-      i--; skips++;
-    }
+  /** 공백·문장부호를 뺀 본문 앞부분으로 만든 느슨한 키: 요청 속 글과 원본 글이 조금 달라도 같은 메시지로 본다 */
+  function looseKey(role, text) {
+    return `l:${hashText(role + '\u0000' + cleanText(stripMeta(String(text ?? ''))).replace(/[\s\p{P}\p{S}]/gu, '').slice(0, 400))}`;
   }
 
-  /** 처리했나? 1.0.0 기록(요청 글 해시)도 인정하고, 인정하면 새 키로 옮겨 적는다. */
   function isSeen(e) {
     if (seenSet.has(e.key)) return true;
-    if (e.hash && seenSet.has(e.hash)) { seenSet.add(e.key); return true; }
+    if ((e.hash && seenSet.has(e.hash)) || (e.loose && seenSet.has(e.loose))) { seenSet.add(e.key); return true; }
     return false;
+  }
+
+  function markSeen(e) {
+    seenSet.add(e.key);
+    if (e.loose) seenSet.add(e.loose);
   }
 
   function lastSeenIndex(list) {
@@ -1328,6 +1332,7 @@
   }
 
   function refreshPending() {
+    state.inbox = (state.inbox ?? []).filter(e => !isSeen(e));
     const raw = rawEntries();
     if (!raw.length) return;
     state.pending = ingestTargets(raw).length;
@@ -1650,7 +1655,7 @@
     for (const e of fresh) delete e.subj;
     for (const sid of job.touchedScenes) refreshScene(sceneById(sid));
     for (const aid of job.touchedArcs) refreshArc(arcById(aid));
-    for (const b of batch) seenSet.add(b.entry.key);
+    for (const b of batch) markSeen(b.entry);
     return true;
   }
 
@@ -2447,7 +2452,7 @@
     return clip((keep.length ? keep : parts.slice(0, 1)).join(' '), 140);
   }
 
-  function formatMemories(picks, sc, cfg = settings, bridge = [], unsent = []) {
+  function formatMemories(picks, sc, cfg = settings, bridge = []) {
     const arc = arcById(state.open.arc);
     const arcLine = arc && (arc.kw.length || arc.cast.length)
       ? `<current chapter> ${arc.title || `#${state.arcs.indexOf(arc) + 1}`}${whenTag(arc.from) ? ` · from ${whenTag(arc.from)}` : ''}${arc.places.length ? ` · ${arc.places.slice(0, 2).join(', ')}` : ''}${arc.kw.length ? ` · ${arc.kw.slice(0, 6).join(', ')}` : ''}`
@@ -2463,7 +2468,7 @@
     const featured = new Set([...present, ...asked, ...(personaCache && isPerson(canonical(personaCache)) ? [canonical(personaCache)] : [])]);
     const headers = new Map();
     if (cfg.bonds) for (const n of featured) { const h = personHeader(n, featured, present); if (h) headers.set(n, h); }
-    if (!picks.length && !arcLine && !headers.size && !bridge.length && !unsent.length) return '';
+    if (!picks.length && !arcLine && !headers.size && !bridge.length) return '';
     const label = cfg.injectLabel;
     const line = (e, group) => {
       const w = cfg.showStoryTime ? whenTag(e.when) : '';
@@ -2501,8 +2506,7 @@
     const note = cfg.note && cfg.translate !== 'off' ? `${cfg.note} Names may be romanized.` : cfg.note;
     // 원문 바로 앞에 붙는 자리: 이 장면에서 방금 전까지의 흐름
     const flow = bridge.length ? ['<earlier in this scene>', ...bridge.map(e => line(e, ''))].join('\n') : '';
-    const pending = unsent.length ? ['<not yet summarized>', ...unsent.map(r => `- ${r.role === 'user' ? '(user) ' : ''}${clip(cleanText(stripMeta(r.text)).replace(/\s*\n\s*/g, ' '), 600)}`)].join('\n') : '';
-    return [`[${label}]`, note, arcLine + prevLine, body, flow, pending, `[/${label}]`].filter(Boolean).join('\n');
+    return [`[${label}]`, note, arcLine + prevLine, body, flow, `[/${label}]`].filter(Boolean).join('\n');
   }
 
   // 메모 줄만 영어로. 같은 줄은 이번 실행 동안만 기억해 두고 다시 번역하지 않는다(저장하지 않음).
@@ -2604,31 +2608,26 @@
       if (!ready() || !await ensureChat() || state.off) return messages;
       const cfg = settings;
       const entries = chatEntries(messages);
-      const raw = rawEntries();
-      alignKeys(entries, raw);
-      for (const e of entries) isSeen(e); // 1.0.0 기록을 새 키로 옮김
-      state.turn = (state.turn ?? 0) + 1;
-      if (cfg.rejAutoClear && state.turn - (state.rejClearedTurn ?? 0) >= cfg.rejClearEvery) { rejSet = new Set(); state.rejClearedTurn = state.turn; }
-      lastEntries = { key: chatKey, entries, raw };
-      // Risu가 보내지 않은 이전 메시지(프롬프트 템플릿의 채팅 범위 밖)
-      const reqKeys = new Set(entries.map(e => e.key));
-      const firstSent = raw.findIndex(r => reqKeys.has(r.key));
-      const notSent = firstSent > 0 ? raw.slice(0, firstSent) : [];
-
-      // 잘라내야 하는 메시지가 "다음 처리 순서"의 맨 앞이면 지금 처리한다.
-      // 더 오래된 메시지가 밀려 있으면 순서를 지키려고 기다린다(그동안은 원문 그대로 보냄).
+      // 요청에 실린 메시지 중 아직 정리 안 된 것은 받은편지함에 넣는다. 다음 턴에 요청에서 빠져도 놓치지 않게.
+      state.inbox ??= [];
+      const queued = new Set(state.inbox.flatMap(x => [x.key, x.loose]));
+      for (const e of entries) {
+        if (isSeen(e) || queued.has(e.key) || queued.has(e.loose)) continue;
+        state.inbox.push({ key: e.key, hash: e.hash, loose: e.loose, role: e.role, text: e.text });
+      }
+      if (state.inbox.length > INBOX_MAX) state.inbox = state.inbox.slice(-INBOX_MAX);
+      // 이번 요청에서 빠졌는데 아직 메모가 안 된 메시지는 지금 만든다(보통은 답장 뒤에 이미 만들어져 있다)
       if (!job) {
-        const outsideKeys = new Set(notSent.map(e => e.key));
-        const now = [];
-        for (const t of (raw.length ? ingestTargets(raw) : [])) {
-          if (!outsideKeys.has(t.key)) break;
-          now.push(t);
-        }
-        if (now.length) {
-          try { await ingest(now, cfg, SYNC_BATCHES); }
-          catch (error) { setError('저장', error); }
+        const inReq = new Set(entries.flatMap(e => [e.key, e.loose]));
+        const stale = state.inbox.filter(x => !isSeen(x) && !inReq.has(x.key) && !inReq.has(x.loose));
+        if (stale.length) {
+          try { await ingest(stale, cfg, 2); } catch (error) { setError('저장', error); }
+          state.inbox = state.inbox.filter(x => !isSeen(x));
         }
       }
+      state.turn = (state.turn ?? 0) + 1;
+      if (cfg.rejAutoClear && state.turn - (state.rejClearedTurn ?? 0) >= cfg.rejClearEvery) { rejSet = new Set(); state.rejClearedTurn = state.turn; }
+      lastEntries = { key: chatKey, entries };
 
       // 원문이 남는 최근 메시지로 이야기 시계(표시용)만 맞춘다
       if (cfg.parseStatus) {
@@ -2644,20 +2643,10 @@
 
       const { picks, trace, sc, bridge } = await recall(entries, visible, cfg);
       for (const { e } of picks) { e.hits++; e.lastHit = state.turn; }
-      // 아직 정리 못 한(그리고 Risu도 안 보낸) 메시지는 원문을 잠깐 넣어 흐름이 비지 않게
-      const unsent = [];
-      let unsentTokens = 0;
-      for (const r of notSent.filter(x => !isSeen(x)).reverse()) {
-        const t = estimateTokens(r.text);
-        if (unsentTokens + t > UNSENT_MAX_TOKENS && unsent.length) break;
-        unsentTokens += t;
-        unsent.unshift(r);
-      }
-      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge, unsent), cfg);
+      const block = await translateBlock(formatMemories(picks, sc, cfg, bridge), cfg);
       const injectedTokens = block ? estimateTokens(block) : 0;
       state.scene = { cast: sc.cast, d: sc.d, t: sc.t, day: sc.day, place: sc.place };
-      refreshPending();
-      state.lastRecall = { ...trace, kept: entries.length, notSent: notSent.length, unsent: unsent.length, injectedTokens, preview: block, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
+      state.lastRecall = { ...trace, kept: entries.length, injectedTokens, preview: block, picks: picks.map(x => ({ id: x.e.id, p: round2(x.p) })) };
       void persist();
       return inject(messages, block, cfg);
     } catch (error) {
@@ -2670,16 +2659,20 @@
 
   async function afterRequestHandler(content, type) {
     if ((type !== 'model' && type !== 'main') || !content || job || !lastEntries || !ready()) return content;
-    const snap = lastEntries;
-    if (snap.key !== chatKey || state.off) return content;
-    // 원본 기준으로 오래된 것부터. (원본을 못 읽으면 요청 속 메시지로)
-    const pending = snap.raw?.length ? ingestTargets(snap.raw) : snap.entries.slice(0, -SETTLE).filter(e => !isSeen(e));
+    if (lastEntries.key !== chatKey || state.off) return content;
+    // 받은편지함(요청에 실렸던, 아직 정리 안 된 메시지)을 오래된 것부터. 바쁘면 다음 턴에 이어서.
+    const key = chatKey;
+    const pending = (state.inbox ?? []).filter(e => !isSeen(e));
     job = (async () => {
       if (pending.length) await ingest(pending, settings, BACKGROUND_BATCHES);
       await compressRecalled(settings);
     })()
       .catch(error => setError('백그라운드 저장', error))
-      .finally(() => { job = null; refreshPending(); void persist(); });
+      .finally(() => {
+        job = null;
+        if (chatKey === key) { state.inbox = (state.inbox ?? []).filter(e => !isSeen(e)); state.pending = state.inbox.length; }
+        void persist();
+      });
     return content;
   }
 
@@ -2697,7 +2690,7 @@
    * 이미 정리된 기억보다 앞부분이 비어 있으면(순서 꼬임) ORDER_GAP 오류 → rebuild: true로 다시 부른다.
    */
   async function processAll(onProgress, { rebuild = false } = {}) {
-    if (!await ensureChat()) throw new Error('채팅방을 먼저 열어 주세요.');
+    if (!await ensureChat({ full: true })) throw new Error('채팅방을 먼저 열어 주세요.');
     if (job) await job;
     const raw = rawEntries();
     if (!raw.length) {
@@ -2856,7 +2849,7 @@
     ui.editing = null;
     if (!settings.onboarded || !settings.jevKey) ui.wiz = ui.wiz ?? { step: 1, d: { ...settings } };
     else if (!ui.wiz?.manual) ui.wiz = null; // 설정이 끝났으면 사용자가 직접 연 경우가 아니면 안내를 닫는다
-    try { if (await ensureChat()) refreshPending(); } catch (error) { setError('채팅 확인', error); }
+    try { if (await ensureChat({ full: true })) refreshPending(); } catch (error) { setError('채팅 확인', error); }
     render();
   }
 
@@ -3062,7 +3055,7 @@
       </div>
       <div class="sec">마지막 회상 ${last ? `<span class="small" style="font-weight:400">· ${timeAgo(last.at)} · ${last.ms}ms</span>` : ''}</div>
       ${last ? `<div class="card">
-        <div class="row small muted" style="gap:14px"><span>Risu가 보낸 원문 ${last.kept}개</span><span>안 보낸 이전 메시지 ${last.notSent ?? 0}개${last.unsent ? ` (정리 전 원문 ${last.unsent}개)` : ''}</span><span>메모 ${last.picks.length}개 주입 (~${last.injectedTokens}토큰)</span><span>${last.usedEmbed ? '임베딩 ✓' : '임베딩 ✕'} · ${last.usedJev ? 'Jev ✓' : '<span class="err">Jev ✕</span>'}</span></div>
+        <div class="row small muted" style="gap:14px"><span>Risu가 보낸 원문 ${last.kept}개 (그 앞은 메모로)</span><span>메모 ${last.picks.length}개 주입 (~${last.injectedTokens}토큰)</span><span>${last.usedEmbed ? '임베딩 ✓' : '임베딩 ✕'} · ${last.usedJev ? 'Jev ✓' : '<span class="err">Jev ✕</span>'}</span></div>
         <div style="margin-top:8px">${picks || `<div class="small muted">${escapeHtml(last.note || '이번엔 넣을 만한 메모가 없었어요.')}</div>`}</div>
         <div class="row" style="margin-top:8px"><button class="btn sm" data-act="tab" data-tab="trace">자세히 보기</button></div>
       </div>` : '<div class="card small muted">이 채팅에서 메시지를 보내면 여기에 무엇을 넣었는지 보여요.</div>'}
@@ -3367,7 +3360,7 @@
     // 마지막 요청이 있으면 그걸, 없으면 채팅 원본의 최근 메시지로 "지금 대화"를 만든다.
     let base = lastEntries?.key === chatKey ? lastEntries.entries : null;
     if (!base) {
-      if (!await ensureChat()) throw new Error('채팅방을 먼저 열어 주세요.');
+      if (!await ensureChat({ full: true })) throw new Error('채팅방을 먼저 열어 주세요.');
       base = rawEntries().slice(-6).map((e, i) => ({ ...e, index: i })); // 아직 요청이 없으면 Risu가 최근 6개쯤 보낸다고 친다
       if (!base.length) throw new Error('채팅 원본을 읽지 못했어요. 채팅방이 열려 있는지 확인해 주세요.');
     }
@@ -3388,13 +3381,13 @@
     return `<div class="sec">Jev 연결</div><div class="card">${jevFields(d)}</div>
       <div class="sec">임베딩</div><div class="card">${embedFields(d)}</div>
       <div class="sec">기억 주입</div><div class="card">
-        <div class="help" style="margin-bottom:8px">원문은 Risu가 보낸 그대로 두고, Risu가 보내지 않은 이전 대화만 메모로 넣어요. 토큰을 더 아끼려면 Risu의 최대 컨텍스트나 프롬프트 템플릿의 채팅 범위를 줄이세요(예: 최근 2~10개).</div>
-          ${field('메모 주입 예산 (토큰)', '0이면 회상을 끕니다.', num('recallBudget', 0, 20000))}
-          ${field('장면당 메모 수', '장면마다 중요한 사건 몇 개만 남길지. 적을수록 쓸모없는 메모가 줄어요.', num('eventsPerScene', 1, 20))}
-          ${field('Jev 후보 수', '매 턴 Jev에게 물어볼 메모 수.', num('candidates', 4, 200))}
-          ${field('대단원 후보 수', '먼저 고를 대단원 수.', num('arcs', 1, 10))}
-          ${field('회상 기준 (%)', 'Jev가 "필요"라고 본 확률이 이 이상이면 넣어요. 등장인물의 인물정보·관계·약속·비밀은 기준을 낮춰 줘요.', num('recallThreshold', 1, 99))}
-          ${field('저장 기준 (%)', '"잡담·사소함"이 아니라고 본 확률이 이 이상인 문장만 메모 후보가 돼요.', num('saveThreshold', 1, 99))}
+        <div class="help" style="margin-bottom:8px">Risu가 보낸 대화는 그대로 두고, 그보다 옛날 대화만 메모로 넣어요.</div>
+          ${field('메모 주입 예산 (토큰)', '메모를 최대 이만큼 넣어요. 크면 많이 기억, 작으면 토큰 절약. 0이면 옛날 메모는 안 넣어요.', num('recallBudget', 0, 20000))}
+          ${field('장면당 메모 수', '한 장면에서 남길 메모 개수. 적으면 꼭 필요한 것만 남아요.', num('eventsPerScene', 1, 20))}
+          ${field('Jev 후보 수', '매번 Jev가 검토할 메모 수. 많으면 덜 놓치지만 Jev 비용이 늘어요.', num('candidates', 4, 200))}
+          ${field('대단원 후보 수', '지금 대화와 가까운 챕터를 몇 개 우선할지.', num('arcs', 1, 10))}
+          ${field('회상 기준 (%)', '높이면 꼭 필요한 메모만, 낮추면 더 많이 넣어요.', num('recallThreshold', 1, 99))}
+          ${field('저장 기준 (%)', '높이면 중요한 문장만 저장, 낮추면 더 많이 저장해요(잡메모도 늘어요).', num('saveThreshold', 1, 99))}
         </div>
       <div class="sec">추출 · 정리</div><div class="card">
         ${field('대사 줄에서 이름 뽑기', '이름(억양): "대사" 같은 줄이 있으면 화자를 인물로 등록해요.', sw('parseSpeakers', d.parseSpeakers))}
@@ -3962,7 +3955,7 @@
   if (globalThis.__JM2_TEST__) {
     globalThis.__JM2_TEST__.x = {
       analyzeEntry, parseStatus, subjectOf, outfitSnippet, sceneCap, translateBlock, rankProb, packSentences, trackSpeech, speechLevel, addressTerms, catchUp, runTest, renderTimeline, dayLabel, renderBonds, bondPairs, personHeader, isThread, parseSpeakerLine, findIntros, wordCandidates, freeTrim, hashEmbed, embedTexts, encodeVec, decodeVec, dot,
-      ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, alignKeys, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
+      ingest, recall, formatMemories, stripMeta, pickUnits, compressRecalled, duplicateGroups, samePerson, mergePeople, romanize, setPipeline: (v) => { PIPELINE = v; }, rawEntries, refreshPending, ensureChat, beforeRequestHandler, afterRequestHandler, processAll, reembedAll, dryRun,
       saveSettings, sanitizeSettings, embedProfile, cleanKey, keyProblem, callJev, mergeAlias, retagAll, addEntity, openPanel, render,
       getState: () => state, getSettings: () => settings, getSeen: () => seenSet, stats, ui, waitJob: () => job ?? Promise.resolve(),
     };
